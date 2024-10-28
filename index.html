@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'>
+<title>404</title>
+</head>
+<body>
+<div id='divTyping'></div>
+<script>
+   var str = '恭喜您开启了一个新的世界，此域名不允许您直接访问。';
+   var i = 0;
+   function typing(){
+    var divTyping = document.getElementById('divTyping');
+    if (i <= str.length) {
+     divTyping.innerHTML = str.slice(0, i++) + '_';
+     setTimeout('typing()', 200);//递归调用
+    }
+    else{
+     divTyping.innerHTML = str;//结束打字,移除 _ 光标
+    }
+   }
+   typing();
+  </script>
+</body>
+</html>
