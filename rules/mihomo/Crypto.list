@@ -1,5 +1,6 @@
-# > Bybit-EU
-DOMAIN-SUFFIX,bybit.eu
+payload:
+  # > Bybit-EU
+  - DOMAIN-KEYWORD,bybit.eu
 
-# > Curve
-DOMAIN-SUFFIX,curve.com
+  # > Curve
+  - DOMAIN-KEYWORD,curve.com
