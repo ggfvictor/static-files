@@ -124,6 +124,15 @@
       font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
       font-variant-numeric: tabular-nums;
     }
+    .release-footer__stage {
+      position: relative;
+      top: -4px;
+      color: #8bc5ac;
+      font-size: 9px;
+      font-weight: 700;
+      font-style: italic;
+      line-height: 1;
+    }
     .footer-brand { letter-spacing: .06em; white-space: nowrap; }
     .record-link {
       display: inline-flex;
@@ -178,6 +187,7 @@
       .site-footer { padding-top: 12px; }
       .release-footer__info { gap: 4px 6px; font-size: clamp(10px, 3vw, 12px); }
       .release-footer__build { gap: 6px; }
+      .release-footer__stage { font-size: 8px; }
     }
     @media (max-height: 540px) and (min-width: 481px) {
       .site-header { padding-top: 20px; padding-bottom: 20px; }
@@ -223,10 +233,11 @@
       <span class="release-footer__item">© HICAT 2026</span>
       <span class="release-footer__build">
         <span class="release-footer__separator" aria-hidden="true">/</span>
-        <span class="release-footer__item" lang="en">Currently v<span id="release-version">1.0.0</span></span>
+        <span class="release-footer__item" lang="en">Currently v<span id="release-version">1.0.1</span></span>
         <span class="release-footer__separator" aria-hidden="true">/</span>
         <span class="release-footer__revision">
           <span class="release-footer__sha" id="release-commit" title="尚未生成发布提交信息">local</span>
+          <span class="release-footer__stage" lang="en">stable</span>
         </span>
       </span>
     </div>
