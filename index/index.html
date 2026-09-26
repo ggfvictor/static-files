@@ -85,21 +85,51 @@
       text-wrap: pretty;
     }
     .site-footer {
-      display: flex;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
       align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 8px 24px;
+      gap: 0 20px;
       margin: 0 var(--space);
-      padding: 16px 0;
-      padding-bottom: max(16px, env(safe-area-inset-bottom));
+      padding: 16px 0 12px;
+      padding-bottom: max(12px, env(safe-area-inset-bottom));
       border-top: 1px solid var(--line);
+      color: var(--muted);
+      text-align: left;
+      font-size: 12px;
+      line-height: 1.75;
     }
-    .footer-brand { color: var(--muted); font-size: 12px; letter-spacing: .06em; }
+    .release-footer__info {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      justify-self: center;
+      gap: 4px 8px;
+      text-align: center;
+    }
+    .release-footer__item { white-space: nowrap; }
+    .release-footer__build {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+    }
+    .release-footer__separator { opacity: .45; }
+    .release-footer__revision {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .release-footer__sha {
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .footer-brand { letter-spacing: .06em; white-space: nowrap; }
     .record-link {
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      justify-self: end;
       gap: 8px;
       min-height: 44px;
       padding: 8px 4px;
@@ -108,6 +138,7 @@
       line-height: 1.75;
       text-decoration: none;
       text-underline-offset: 4px;
+      white-space: nowrap;
     }
     .external-icon { width: 12px; height: 12px; flex: none; }
     .record-link:hover { color: var(--ice); text-decoration: underline; }
@@ -131,6 +162,11 @@
         to { opacity: 1; transform: translateY(0); }
       }
     }
+    @media (max-width: 760px) {
+      .site-footer { grid-template-columns: minmax(0, 1fr); justify-items: center; gap: 4px; text-align: center; }
+      .site-footer > * { min-height: 21px; line-height: 21px; }
+      .record-link { justify-self: center; padding: 0 4px; }
+    }
     @media (max-width: 480px) {
       .site-header { padding-top: max(24px, env(safe-area-inset-top)); padding-bottom: 24px; }
       .brand { gap: 12px; }
@@ -139,8 +175,9 @@
       .polar-scene { width: 176px; margin-bottom: 24px; }
       h1 { letter-spacing: .03em; }
       .description { margin-top: 20px; }
-      .site-footer { justify-content: center; padding-top: 12px; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
-      .footer-brand { display: none; }
+      .site-footer { padding-top: 12px; }
+      .release-footer__info { gap: 4px 6px; font-size: clamp(10px, 3vw, 12px); }
+      .release-footer__build { gap: 6px; }
     }
     @media (max-height: 540px) and (min-width: 481px) {
       .site-header { padding-top: 20px; padding-bottom: 20px; }
@@ -182,11 +219,51 @@
   </main>
   <footer class="site-footer">
     <span class="footer-brand">北极熊 <span aria-hidden="true">·</span> 世界的另一面</span>
+    <div class="release-footer__info" role="group" aria-label="版权与版本信息">
+      <span class="release-footer__item">© HICAT 2026</span>
+      <span class="release-footer__build">
+        <span class="release-footer__separator" aria-hidden="true">/</span>
+        <span class="release-footer__item" lang="en">Currently v<span id="release-version">1.0.0</span></span>
+        <span class="release-footer__separator" aria-hidden="true">/</span>
+        <span class="release-footer__revision">
+          <span class="release-footer__sha" id="release-commit" title="尚未生成发布提交信息">local</span>
+        </span>
+      </span>
+    </div>
     <a class="record-link" href="https://beian.miit.gov.cn/" rel="external nofollow noopener noreferrer" target="_blank">
       浙ICP备17004373号-19
       <svg class="external-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9 3h4v4m0-4L7 9M6 3H3v10h10v-3"/></svg>
       <span class="sr-only">（在新标签页打开）</span>
     </a>
   </footer>
+  <script>
+    // This standalone page is the version source; release.json is generated after committing.
+    (async () => {
+      if (location.protocol === 'file:') return;
+      const version = document.getElementById('release-version').textContent.trim();
+      const versionPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+      if (!versionPattern.test(version)) return;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      try {
+        const url = new URL('release.json', document.baseURI);
+        url.searchParams.set('v', version);
+        const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
+        if (!response.ok) return;
+        const release = await response.json();
+        if (!release || release.version !== version ||
+            typeof release.commit !== 'string' || !/^[0-9a-f]{7,40}$/i.test(release.commit) ||
+            typeof release.commitFull !== 'string' || !/^[0-9a-f]{40}$/i.test(release.commitFull) ||
+            !release.commitFull.toLowerCase().startsWith(release.commit.toLowerCase())) return;
+        const commit = document.getElementById('release-commit');
+        commit.textContent = release.commit.slice(0, 7);
+        commit.title = release.commitFull;
+      } catch {
+        // Missing or stale release metadata leaves the explicit local label in place.
+      } finally {
+        clearTimeout(timeout);
+      }
+    })();
+  </script>
 </body>
 </html>
