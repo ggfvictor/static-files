@@ -74,9 +74,11 @@ def main():
         (staging / "release.json").write_bytes(release_json)
         (staging / "release-notes.md").write_text(
             f"北极熊单页 v{version}\n\n"
-            "- 保留北极熊插画、深色背景、品牌与备案外链。\n"
-            "- 桌面页脚按左、中、右排列；窄屏统一为三行居中，高度与间距一致。\n"
-            "- 版权与版本信息读取本次提交生成的 release.json。\n\n"
+            "- 版权品牌根据访问主域名自动显示，支持子域名与标准公共后缀规则。\n"
+            "- 浏览器首选语言为中文时显示中文版，其他语言显示英文版。\n"
+            "- 右上角可手动切换中文与 English，并在浏览器允许时记住选择。\n"
+            "- 保留北极熊插画、深色背景及备案外链；长名称或窄屏下页脚整体居中分行。\n"
+            "- 版本、stable 标识和提交号来自本次发布，内置域名解析库无需外部请求。\n\n"
             f"源码提交：`{commit_full}`\n\n"
             "部署时将 ZIP 内的 index.html 和 release.json 放在同一目录；"
             "只拉取源码不会生成发布元数据。SHA256SUMS.txt 可用于校验下载包。\n"
