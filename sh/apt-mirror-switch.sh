@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Debian / Ubuntu APT 国内镜像切换工具。需要 Bash 3.2+，不适用于 sh。
+# Debian / Ubuntu APT 国内 / 国际镜像切换工具。需要 Bash 3.2+，不适用于 sh。
 set -Eeuo pipefail
 export LC_ALL=C
 umask 077
@@ -12,6 +12,9 @@ LOCK_FILE=/run/lock/apt-mirror-switch.lock
 MARKER='# Managed by apt-mirror-switch v1'
 
 MIRROR=''
+REGION=auto
+COUNTRY=''
+PUBLIC_IP=''
 FORMAT=auto
 DRY_RUN=0
 ASSUME_YES=0
@@ -25,6 +28,7 @@ WITH_SOURCE=0
 PLAN_PATHS=()
 PLAN_STATES=()
 PLAN_FILES=()
+PROBE_PIDS=()
 
 say() { printf '%s\n' "$*"; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -33,9 +37,12 @@ usage() {
     cat <<'HELP'
 用法：sudo bash apt-mirror-switch.sh [选项]
 
-不带选项时，识别系统和架构，显示镜像菜单，再确认执行。
+不带选项时，识别系统、架构和公网出口地区，显示镜像菜单，再确认执行。
 
-  --mirror NAME       ustc / aliyun / tencent / tsinghua / huawei / official
+  --mirror NAME       auto / ustc / aliyun / tencent / tsinghua / huawei /
+                      official / kernel / fau / xtom-us / xtom-jp
+  --region REGION     auto（默认，查询公网 IP）/ cn / global
+                      auto 镜像模式按地区探测候选，选择索引探测耗时最短的可用站
   --dry-run           预览将写入的源和受影响文件，不改 APT 配置，不更新索引
   --yes, -y           跳过写入前确认（仍需指定 --mirror）
   --no-update         切换后不执行 apt-get update
@@ -46,6 +53,9 @@ usage() {
 
 示例：
   bash apt-mirror-switch.sh --mirror ustc --dry-run
+  bash apt-mirror-switch.sh --mirror auto --dry-run
+  sudo bash apt-mirror-switch.sh --mirror auto --yes
+  sudo bash apt-mirror-switch.sh --mirror auto --region global --yes
   sudo bash apt-mirror-switch.sh --mirror aliyun --yes
   sudo bash apt-mirror-switch.sh --restore latest
 
@@ -56,12 +66,13 @@ HELP
 
 while (($#)); do
     case "$1" in
-        --mirror|--format|--restore)
+        --mirror|--format|--restore|--region)
             (($# >= 2)) || die "$1 缺少参数"
             case "$1" in
                 --mirror) MIRROR=$2 ;;
                 --format) FORMAT=$2 ;;
                 --restore) RESTORE_ID=$2 ;;
+                --region) REGION=$2 ;;
             esac
             shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -73,11 +84,12 @@ while (($#)); do
     esac
 done
 case "$FORMAT" in auto|sources|list) ;; *) die "不支持的格式：$FORMAT" ;; esac
+case "$REGION" in auto|cn|global) ;; *) die "不支持的地区：$REGION（auto / cn / global）" ;; esac
 if [[ -n "$RESTORE_ID" ]]; then
-    [[ -z "$MIRROR" && "$FORMAT" == auto && $LIST_BACKUPS == 0 ]] || die '--restore 不能与镜像、格式或列出备份选项混用'
+    [[ -z "$MIRROR" && "$FORMAT" == auto && "$REGION" == auto && $LIST_BACKUPS == 0 ]] || die '--restore 不能与镜像、格式、地区或列出备份选项混用'
 fi
 if ((LIST_BACKUPS)); then
-    [[ -z "$MIRROR" && -z "$RESTORE_ID" ]] || die '--list-backups 不能与切换或恢复操作混用'
+    [[ -z "$MIRROR" && -z "$RESTORE_ID" && "$REGION" == auto ]] || die '--list-backups 不能与切换、恢复或地区选项混用'
 fi
 
 valid_relative_path() {
@@ -145,9 +157,12 @@ rollback_snapshot() {
 }
 
 cleanup() {
-    local rc=$?
+    local rc=$? probe_pid
     trap - EXIT INT TERM
     set +e
+    if ((${#PROBE_PIDS[@]})); then
+        for probe_pid in "${PROBE_PIDS[@]}"; do kill "$probe_pid" 2>/dev/null; done
+    fi
     if ((MUTATING)); then
         say '操作未完成，正在恢复切换前的源配置……' >&2
         if rollback_snapshot "$ACTIVE_BACKUP"; then
@@ -332,38 +347,232 @@ for apt_arch in $ARCH $FOREIGN_ARCHES; do
     fi
 done
 
+json_value() {
+    # 仅从小型定位响应取字符串，不 eval、不 source 远程内容。
+    awk -v key="$1" '
+        match($0, "\"" key "\"[ \t]*:[ \t]*\"[^\"]*\"") {
+            v = substr($0, RSTART, RLENGTH)
+            sub(/^[^:]*:[ \t]*"/, "", v); sub(/"$/, "", v)
+            print v; exit
+        }'
+}
+
+valid_country() {
+    [[ "$COUNTRY" =~ ^[A-Z]{2}$ && "$COUNTRY" != XX && "$COUNTRY" != ZZ ]]
+}
+
+resolve_region() {
+    local response=''
+    if [[ "$REGION" != auto ]]; then
+        say "镜像地区：$REGION（手动指定，不查询公网 IP）"
+        return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        say '未安装 curl，无法查询公网出口地区；可手动选择镜像。' >&2
+        return 1
+    fi
+    say '正在查询公网出口地区（Cloudflare，失败时使用 country.is）……'
+    if response=$(curl -fLsS --proto '=https' --proto-redir '=https' \
+        --connect-timeout 2 --max-time 4 --max-filesize 65536 \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null); then
+        COUNTRY=$(printf '%s\n' "$response" | awk -F= '$1 == "loc" { print $2; exit }')
+        PUBLIC_IP=$(printf '%s\n' "$response" | awk -F= '$1 == "ip" { print $2; exit }')
+    fi
+    if ! valid_country; then
+        COUNTRY=''; PUBLIC_IP=''
+        if response=$(curl -fLsS --proto '=https' --proto-redir '=https' \
+            --connect-timeout 2 --max-time 4 --max-filesize 65536 \
+            https://api.country.is/ 2>/dev/null); then
+            COUNTRY=$(printf '%s\n' "$response" | json_value country)
+            PUBLIC_IP=$(printf '%s\n' "$response" | json_value ip)
+        fi
+    fi
+    if ! valid_country; then
+        COUNTRY=''; PUBLIC_IP=''
+        say '公网 IP 地区查询失败，未假定服务器位于国内或国际地区。' >&2
+        return 1
+    fi
+    [[ "$PUBLIC_IP" =~ ^[0-9A-Fa-f:.]+$ ]] || PUBLIC_IP=''
+    if [[ "$COUNTRY" == CN ]]; then REGION=cn; else REGION=global; fi
+    say "公网出口：${PUBLIC_IP:-未获取 IP}；国家/地区代码：$COUNTRY；候选地区：$REGION"
+    say '定位反映当前请求的公网出口；代理、VPN 和 IP 数据库误差可能影响结果。'
+}
+
+mirror_supported() {
+    # 这些站点缺少 ubuntu-ports；不能把 Ubuntu ARM64 指向 ubuntu。
+    if [[ "$DISTRO" == ubuntu && -n "$PORTS_ARCHES" ]]; then
+        case "$1" in kernel|xtom-us|xtom-jp) return 1 ;; esac
+    fi
+    return 0
+}
+
+configure_mirror() {
+    local base=''
+    DEBIAN_URL=https://deb.debian.org/debian
+    DEBIAN_SECURITY_URL=https://security.debian.org/debian-security
+    UBUNTU_URL=https://archive.ubuntu.com/ubuntu
+    UBUNTU_SECURITY_URL=https://security.ubuntu.com/ubuntu
+    UBUNTU_PORTS_URL=https://ports.ubuntu.com/ubuntu-ports
+    case "$1" in
+        ustc) base=https://mirrors.ustc.edu.cn ;;
+        aliyun) base=https://mirrors.aliyun.com ;;
+        tencent) base=https://mirrors.cloud.tencent.com ;;
+        tsinghua) base=https://mirrors.tuna.tsinghua.edu.cn ;;
+        huawei) base=https://mirrors.huaweicloud.com ;;
+        official) ;;
+        kernel)
+            DEBIAN_URL=https://mirrors.edge.kernel.org/debian
+            UBUNTU_URL=https://mirrors.edge.kernel.org/ubuntu
+            UBUNTU_PORTS_URL='' ;;
+        fau)
+            DEBIAN_URL=https://ftp.fau.de/debian
+            UBUNTU_URL=https://ftp.fau.de/ubuntu
+            UBUNTU_PORTS_URL=https://ftp.fau.de/ubuntu-ports ;;
+        xtom-us) base=https://mirrors.xtom.com ;;
+        xtom-jp) base=https://mirrors.xtom.jp ;;
+        *) return 1 ;;
+    esac
+    if [[ -n "$base" ]]; then
+        DEBIAN_URL=$base/debian
+        DEBIAN_SECURITY_URL=$base/debian-security
+        UBUNTU_URL=$base/ubuntu
+        UBUNTU_SECURITY_URL=$base/ubuntu
+        UBUNTU_PORTS_URL=$base/ubuntu-ports
+        case "$1" in xtom-*) UBUNTU_PORTS_URL='' ;; esac
+    fi
+}
+
+probe_mirror() {
+    local candidate=$1 order=$2 i elapsed body available apt_arch expected_codename
+    local total_ms=0
+    local urls=() suites=() arches=()
+    configure_mirror "$candidate" || return 1
+    if [[ "$DISTRO" == debian ]]; then
+        urls=("$DEBIAN_URL" "$DEBIAN_SECURITY_URL")
+        suites=("$CODENAME" "$CODENAME-security")
+        arches=("$ARCHES" "$ARCHES")
+    else
+        if [[ -n "$PC_ARCHES" ]]; then
+            urls+=("$UBUNTU_URL" "$UBUNTU_SECURITY_URL")
+            suites+=("$CODENAME" "$CODENAME-security")
+            arches+=("$PC_ARCHES" "$PC_ARCHES")
+        fi
+        if [[ -n "$PORTS_ARCHES" ]]; then
+            urls+=("$UBUNTU_PORTS_URL" "$UBUNTU_PORTS_URL")
+            suites+=("$CODENAME" "$CODENAME-security")
+            arches+=("$PORTS_ARCHES" "$PORTS_ARCHES")
+        fi
+    fi
+    for ((i=0; i<${#urls[@]}; i++)); do
+        body=$WORK_DIR/probe-$order-$i
+        elapsed=$(curl -fLsS --proto '=https' --proto-redir '=https' \
+            --connect-timeout 2 --max-time 6 --max-filesize 2097152 \
+            --output "$body" --write-out '%{time_total}' \
+            "${urls[$i]}/dists/${suites[$i]}/InRelease" 2>/dev/null) || return 1
+        [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+        grep -Fqx -- '-----BEGIN PGP SIGNED MESSAGE-----' "$body" || return 1
+        if [[ "$DISTRO" == ubuntu ]]; then
+            # Ubuntu 的 noble-security 仍写 Codename: noble，以 Suite 区分更新渠道。
+            expected_codename=$CODENAME
+            grep -Fqx -- "Suite: ${suites[$i]}" "$body" || return 1
+        else
+            expected_codename=${suites[$i]}
+        fi
+        grep -Fqx -- "Codename: $expected_codename" "$body" || return 1
+        available=$(awk '/^Architectures:/ { sub(/^Architectures:[ \t]*/, ""); print; exit }' "$body")
+        for apt_arch in ${arches[$i]}; do
+            case " $available " in *" $apt_arch "*) ;; *) return 1 ;; esac
+        done
+        total_ms=$(awk -v current="$total_ms" -v seconds="$elapsed" 'BEGIN { printf "%.0f", current + seconds * 1000 }')
+    done
+    printf '%s\t%s\t%s\n' "$total_ms" "$order" "$candidate" > "$WORK_DIR/probe-result-$order"
+}
+
+choose_auto_mirror() {
+    local candidates candidate order=0 probe_pid score measured_order measured_name
+    command -v curl >/dev/null 2>&1 || die '自动探测需要 curl；可改用 --mirror 指定镜像，或先安装 curl'
+    case "$REGION" in
+        cn) candidates='ustc aliyun tencent tsinghua huawei' ;;
+        global) candidates='official fau kernel xtom-us xtom-jp' ;;
+        *) die '尚未确定地区，请使用 --region cn 或 --region global，或手动指定 --mirror' ;;
+    esac
+    say "正在并行探测 $REGION 镜像（主仓库和安全仓库；单次请求最多 6 秒）……"
+    for candidate in $candidates; do
+        if mirror_supported "$candidate"; then
+            probe_mirror "$candidate" "$order" &
+            PROBE_PIDS+=("$!")
+        fi
+        order=$((order + 1))
+    done
+    for probe_pid in "${PROBE_PIDS[@]}"; do wait "$probe_pid" || :; done
+    PROBE_PIDS=()
+    : > "$WORK_DIR/ranking"
+    order=0
+    for candidate in $candidates; do
+        if ! mirror_supported "$candidate"; then
+            say "  $candidate：跳过（没有所需的 Ubuntu ports 仓库）"
+        elif [[ -s "$WORK_DIR/probe-result-$order" ]]; then
+            IFS=$'\t' read -r score measured_order measured_name < "$WORK_DIR/probe-result-$order"
+            say "  $measured_name：${score} ms（所需索引下载合计）"
+            cat "$WORK_DIR/probe-result-$order" >> "$WORK_DIR/ranking"
+        else
+            say "  $candidate：探测失败或缺少所需版本/架构"
+        fi
+        order=$((order + 1))
+    done
+    [[ -s "$WORK_DIR/ranking" ]] || die '候选镜像全部探测失败，未修改配置；请检查网络或使用 --mirror 手动指定镜像'
+    MIRROR=$(sort -n -k1,1 -k2,2 "$WORK_DIR/ranking" | awk 'NR == 1 { print $3 }')
+    say "自动选择：$MIRROR（以本次小索引探测耗时排序，不代表安装软件包的持续下载速度）"
+}
+
 say "系统：${PRETTY_NAME:-$DISTRO}"
 say "代号：$CODENAME；APT 架构：$ARCHES；内核架构：$(uname -m)"
 if [[ -z "$MIRROR" ]]; then
-    ((ASSUME_YES == 0)) || die '--yes 需要同时指定 --mirror'
-    [[ -t 0 ]] || die '请使用 --mirror 指定镜像站'
+    ((ASSUME_YES == 0)) || die '--yes 需要同时指定 --mirror（自动模式使用 --mirror auto）'
+    [[ -t 0 ]] || die '请使用 --mirror 指定镜像站；自动模式使用 --mirror auto'
+fi
+if [[ -z "$MIRROR" || "$MIRROR" == auto ]]; then
+    if ! resolve_region; then
+        if [[ ! -t 0 || $ASSUME_YES == 1 ]]; then
+            die '无法自动定位；请指定 --region cn / global，或使用 --mirror 手动选择'
+        fi
+        MIRROR=''
+    fi
+fi
+if [[ -z "$MIRROR" ]]; then
     cat <<'MENU'
 
-  1) 中国科学技术大学 USTC（默认）
+  a) 根据公网出口地区探测并自动选择（地区已确定时默认）
+  1) 中国科学技术大学 USTC
   2) 阿里云
   3) 腾讯云（公网镜像）
   4) 清华大学 TUNA
   5) 华为云
-  6) Debian / Ubuntu 官方源
+  6) Debian / Ubuntu 官方源（Debian 使用全球 CDN）
+  7) Kernel.org（国际；不提供 Ubuntu ports）
+  8) FAU 德国（国际；提供 Ubuntu ports）
+  9) xTom 美国（国际；不提供 Ubuntu ports）
+ 10) xTom 日本（国际；不提供 Ubuntu ports）
   0) 退出
 MENU
-    printf '请选择 [1-6，默认 1]：'
+    if [[ "$REGION" == auto ]]; then
+        printf '定位失败，请手动输入镜像编号 [1-10]：'
+    else
+        printf '请选择 [a / 1-10，默认 a；当前地区 %s]：' "$REGION"
+    fi
     IFS= read -r choice || exit 1
-    case "${choice:-1}" in
+    if [[ -z "$choice" && "$REGION" != auto ]]; then choice=a; fi
+    case "$choice" in
+        a|A) MIRROR=auto ;;
         1) MIRROR=ustc ;; 2) MIRROR=aliyun ;; 3) MIRROR=tencent ;;
         4) MIRROR=tsinghua ;; 5) MIRROR=huawei ;; 6) MIRROR=official ;;
-        0) exit 0 ;; *) die '无效选择' ;;
+        7) MIRROR=kernel ;; 8) MIRROR=fau ;; 9) MIRROR=xtom-us ;; 10) MIRROR=xtom-jp ;;
+        0) exit 0 ;; *) die '无效选择，请手动选择菜单中的镜像编号' ;;
     esac
 fi
-case "$MIRROR" in
-    ustc) BASE=https://mirrors.ustc.edu.cn ;;
-    aliyun) BASE=https://mirrors.aliyun.com ;;
-    tencent) BASE=https://mirrors.cloud.tencent.com ;;
-    tsinghua) BASE=https://mirrors.tuna.tsinghua.edu.cn ;;
-    huawei) BASE=https://mirrors.huaweicloud.com ;;
-    official) BASE='' ;;
-    *) die "未知镜像：$MIRROR" ;;
-esac
+if [[ "$MIRROR" == auto ]]; then choose_auto_mirror; fi
+mirror_supported "$MIRROR" || die "$MIRROR 不提供 Ubuntu ports，当前架构请使用 official / fau 或国内镜像"
+configure_mirror "$MIRROR" || die "未知镜像：$MIRROR"
 
 if [[ "$DISTRO" == debian ]]; then
     KEYRING=$KEYRING_DIR/debian-archive-keyring.gpg
@@ -413,6 +622,7 @@ filter_sources() {
         if (distro == "debian" && host ~ /^(deb|security|ftp|archive)\.debian\.org$/) return 1
         if (distro == "debian" && host ~ /^ftp\.[a-z][a-z]\.debian\.org$/) return 1
         if (distro == "ubuntu" && (host ~ /^(archive|security|ports|old-releases)\.ubuntu\.com$/ || host ~ /^[a-z][a-z]\.archive\.ubuntu\.com$/)) return 1
+        if (host ~ /^(mirrors\.edge\.kernel\.org|mirrors\.kernel\.org|ftp\.fau\.de|mirrors?\.xtom\.(com|jp|de))$/) return 1
         return host ~ /^(mirrors\.ustc\.edu\.cn|mirrors\.tuna\.tsinghua\.edu\.cn|mirrors\.aliyun\.com|mirrors\.cloud\.aliyuncs\.com|mirrors\.cloud\.tencent\.com|mirrors\.tencentyun\.com|mirrors\.tencent\.com|mirrors\.huaweicloud\.com|repo\.huaweicloud\.com|mirrors\.163\.com|mirrors\.sohu\.com|mirrors\.bfsu\.edu\.cn|mirrors\.nju\.edu\.cn|mirror\.nju\.edu\.cn|mirrors\.sjtug\.sjtu\.edu\.cn|mirror\.sjtu\.edu\.cn|mirrors\.cernet\.edu\.cn|mirrors\.hit\.edu\.cn|mirrors\.hust\.edu\.cn)$/
     }
     function flush(   i,line,pos,key,value,field,uris,enabled,types,n,parts,hits,total,disable) {
@@ -506,15 +716,15 @@ emit_stanza() {
 generate_sources() {
     printf '%s\n# System: %s %s | mirror: %s\n\n' "$MARKER" "$DISTRO" "$CODENAME" "$MIRROR"
     if [[ "$DISTRO" == debian ]]; then
-        emit_stanza "${BASE:-https://deb.debian.org}/debian" "$CODENAME $CODENAME-updates" "$ARCHES"
-        emit_stanza "${BASE:-https://security.debian.org}/debian-security" "$CODENAME-security" "$ARCHES"
+        emit_stanza "$DEBIAN_URL" "$CODENAME $CODENAME-updates" "$ARCHES"
+        emit_stanza "$DEBIAN_SECURITY_URL" "$CODENAME-security" "$ARCHES"
     else
         if [[ -n "$PC_ARCHES" ]]; then
-            emit_stanza "${BASE:-https://archive.ubuntu.com}/ubuntu" "$CODENAME $CODENAME-updates $CODENAME-backports" "$PC_ARCHES"
-            emit_stanza "${BASE:-https://security.ubuntu.com}/ubuntu" "$CODENAME-security" "$PC_ARCHES"
+            emit_stanza "$UBUNTU_URL" "$CODENAME $CODENAME-updates $CODENAME-backports" "$PC_ARCHES"
+            emit_stanza "$UBUNTU_SECURITY_URL" "$CODENAME-security" "$PC_ARCHES"
         fi
         if [[ -n "$PORTS_ARCHES" ]]; then
-            emit_stanza "${BASE:-https://ports.ubuntu.com}/ubuntu-ports" "$CODENAME $CODENAME-updates $CODENAME-backports $CODENAME-security" "$PORTS_ARCHES"
+            emit_stanza "$UBUNTU_PORTS_URL" "$CODENAME $CODENAME-updates $CODENAME-backports $CODENAME-security" "$PORTS_ARCHES"
         fi
     fi
 }
