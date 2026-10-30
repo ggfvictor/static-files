@@ -5,6 +5,7 @@
 # 升级可能重启服务，请在合适的维护窗口执行。
 # 终端仅显示单行进度和结果，完整输出写入日志。
 # 每次运行轮换日志，保留当前日志及 .1 到 .4，共最近 5 份。
+# 运行前显示脚本提交版本，并通过 SHA-256 核对内容；单文件联网查询需 curl。
 set -euo pipefail
 umask 027
 
@@ -36,6 +37,59 @@ fi
 # 保存终端输出，维护命令的 stdout / stderr 统一写入本次日志。
 exec 3>&1 4>&2
 
+describe_version() {
+    local script_path=$1 script_dir script_name
+    local local_digest reference_digest commit_id api_response
+
+    if [[ ! -f "$script_path" || ! -r "$script_path" ]]; then
+        printf '⚠️ 版本：未确认（请下载脚本后运行以校验）\n'
+        return
+    fi
+    if ! local_digest=$(sha256sum <"$script_path" 2>/dev/null); then
+        printf '⚠️ 版本：未确认（无法计算文件校验值）\n'
+        return
+    fi
+    local_digest=${local_digest%% *}
+    script_name=${script_path##*/}
+    script_dir=$(cd -- "$(dirname -- "$script_path")" && pwd -P)
+
+    # 使用最后一次修改本文件的提交，避免把仓库其他文件的更新当作脚本版本。
+    if command -v git >/dev/null 2>&1 &&
+        commit_id=$(git -C "$script_dir" log -1 --format=%H -- "./$script_name" 2>/dev/null) &&
+        [[ $commit_id =~ ^[0-9a-f]{40,64}$ ]] &&
+        reference_digest=$(git -C "$script_dir" show "$commit_id:./$script_name" 2>/dev/null | sha256sum); then
+        reference_digest=${reference_digest%% *}
+        if [[ "$local_digest" == "$reference_digest" ]]; then
+            printf '✅ 版本：%.12s（内容一致）\n' "$commit_id"
+        else
+            printf '⚠️ 版本：%.12s（本地有改动）\n' "$commit_id"
+        fi
+        return
+    fi
+
+    # 单文件没有 Git 元数据：先查询提交，再按该提交下载原文计算摘要。
+    # 摘要不一致时只能确认与仓库版本不同，不能推断本地文件来自哪个提交。
+    if command -v curl >/dev/null 2>&1 &&
+        api_response=$(curl -fsSL --connect-timeout 2 --max-time 4 \
+            'https://api.github.com/repos/ggfvictor/static-files/commits?path=sh/debian-maintenance.sh&per_page=1' 2>/dev/null) &&
+        [[ $api_response =~ \"sha\"[[:space:]]*:[[:space:]]*\"([0-9a-f]{40})\" ]]; then
+        commit_id=${BASH_REMATCH[1]}
+        if reference_digest=$(curl -fsSL --connect-timeout 2 --max-time 4 \
+            "https://raw.githubusercontent.com/ggfvictor/static-files/$commit_id/sh/debian-maintenance.sh" \
+            2>/dev/null | sha256sum); then
+            reference_digest=${reference_digest%% *}
+            if [[ "$local_digest" == "$reference_digest" ]]; then
+                printf '✅ 版本：%.12s（内容一致）\n' "$commit_id"
+            else
+                printf '⚠️ 版本：未确认（与仓库 %.12s 不同）\n' "$commit_id"
+            fi
+            return
+        fi
+    fi
+
+    printf '⚠️ 版本：未确认（无法核对仓库）｜SHA256：%.12s\n' "$local_digest"
+}
+
 show_step() {
     STEP=$1
     printf '%s\n' "$STEP"
@@ -62,6 +116,9 @@ on_failure() {
     trap 'on_failure "$?" "$BASH_COMMAND"' ERR
 
     echo "========== $(date '+%F %T') =========="
+    version_status=$(describe_version "${BASH_SOURCE[0]:-}")
+    printf '%s\n' "$version_status"
+    printf '%s\n' "$version_status" >&3
     if [[ ! -t 3 ]]; then
         printf '⏳ 开始维护…\n' >&3
     fi
