@@ -2,8 +2,9 @@
 # Debian 11+ / Ubuntu 22.04+ 系统维护脚本（APT 2.1.10+）。
 # 用法：sudo bash debian-maintenance.sh
 # 配置文件冲突：优先采用 dpkg 默认处理方式，无默认选择时保留本地配置。
-# 升级可能重启服务，请在合适的维护窗口执行；日志轮转需另行配置。
+# 升级可能重启服务，请在合适的维护窗口执行。
 # 终端仅显示单行进度和结果，完整输出写入日志。
+# 每次运行轮换日志，保留当前日志及 .1 到 .4，共最近 5 份。
 set -euo pipefail
 umask 027
 
@@ -21,7 +22,18 @@ flock -n 9 || {
     exit 1
 }
 
-# 保存终端输出，维护命令的 stdout / stderr 统一追加到日志。
+# 获取锁后轮换，.1 为上次日志，.4 为最早保留的日志。
+rm -f -- "$LOG.4"
+for ((log_index = 3; log_index >= 1; log_index--)); do
+    if [[ -f "$LOG.$log_index" ]]; then
+        mv -- "$LOG.$log_index" "$LOG.$((log_index + 1))"
+    fi
+done
+if [[ -f "$LOG" ]]; then
+    mv -- "$LOG" "$LOG.1"
+fi
+
+# 保存终端输出，维护命令的 stdout / stderr 统一写入本次日志。
 exec 3>&1 4>&2
 
 show_step() {
@@ -98,4 +110,4 @@ on_failure() {
     echo "维护完成：$(date '+%F %T')"
     clear_progress
     printf '%s 维护完成（%s）\n日志：%s\n' "$status_icon" "$reboot_status" "$LOG" >&3
-} >>"$LOG" 2>&1
+} >"$LOG" 2>&1
