@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 # Version of this management script (independent from the installed GOST binary version).
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
@@ -32,7 +32,7 @@ GOST v3 安装及 TCP/UDP 转发管理（Debian/Ubuntu + systemd）
 用法：sudo bash gost-manager.sh [--install|--list|--status|--reload|--version|--help]
 不带参数：单屏交互式菜单，操作结束按 Enter 返回主菜单。
 
-规则管理：添加 TCP、UDP 或两者同时转发；只删除本脚本创建的规则。
+规则管理：添加、修改、删除 TCP/UDP/双协议转发；脚本规则可逐项修改，手工规则可安全编辑 YAML。
 安全设计：下载官方最新稳定版本，校验 SHA256；修改前备份配置；
           通过 SIGHUP 热加载；不覆盖现有 systemd 服务文件或手工规则。
 配置位置：/etc/gost/gost.yml
@@ -468,11 +468,12 @@ for s in cfg.get("services",[]) or []:
 }
 
 check_conflicts() {
-    local host=$1 port=$2 proto=$3 bin
+    local host=$1 port=$2 proto=$3 exclude_rule=${4:-} bin
     bin=$(find_gost)
     "$bin" -C "$CONFIG_FILE" -O json 2>/dev/null | python3 -c '
 import sys, json
-host, port, proto = sys.argv[1:]
+host, port, proto, exclude_rule = sys.argv[1:]
+ignored = {"gm-" + exclude_rule + "-tcp", "gm-" + exclude_rule + "-udp"} if exclude_rule else set()
 services=(json.load(sys.stdin).get("services") or [])
 def split_addr(s):
     h, sep, p = str(s).rpartition(":")
@@ -481,6 +482,8 @@ def clashing(h1,h2):
     wild={"", "0.0.0.0", "::", "[::]"}
     return h1==h2 or h1 in wild or h2 in wild
 for s in services:
+    if s.get("name") in ignored:
+        continue
     listening=(s.get("listener") or {}).get("type") or "tcp"
     if listening != proto and proto != "both":
         continue
@@ -488,7 +491,7 @@ for s in services:
     if p==port and clashing(h,host):
         print("与现有服务端口冲突："+str(s.get("name")),file=sys.stderr)
         sys.exit(3)
-' "$host" "$port" "$proto"
+' "$host" "$port" "$proto" "$exclude_rule"
 }
 
 add_rule() {
@@ -536,6 +539,137 @@ add_rule() {
     staged="$WORK_DIR/rules-new.tsv"
     cp "$RULES_FILE" "$staged"
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$proto" "$listen" "$port" "$target" "$target_port" >>"$staged"
+    apply_staged_rules "$staged"
+}
+
+# Manual YAML editor for existing services not created by this manager.
+# Back up before editing, validate before reloading, and restore on errors.
+edit_manual_yaml() {
+    local editor backup bin
+    require_gost
+    ensure_files
+    if command -v nano >/dev/null 2>&1; then
+        editor=$(command -v nano)
+    elif command -v vi >/dev/null 2>&1; then
+        editor=$(command -v vi)
+    else
+        die '找不到 nano 或 vi；请先安装文本编辑器。'
+    fi
+    warn '手工编辑模式将打开整个 gost.yml。'
+    warn '不要修改 # >>> GOST-MANAGER ... # <<< GOST-MANAGER 管理区；该区会在下一次管理器操作时重新生成。'
+    ask_yes '已了解，继续编辑？' || { info '已取消。'; return; }
+    backup=$(snapshot)
+    info "修改前备份：$backup"
+    if ! "$editor" "$CONFIG_FILE"; then
+        cp -p "$backup/gost.yml" "$CONFIG_FILE"
+        die '编辑器异常退出，已恢复修改前配置。'
+    fi
+    if cmp -s "$backup/gost.yml" "$CONFIG_FILE"; then
+        info '配置没有变化，无需热加载。'
+        return 0
+    fi
+    bin=$(find_gost)
+    if ! "$bin" -C "$CONFIG_FILE" -O yaml >"$WORK_DIR/manual-check.out" 2>"$WORK_DIR/manual-check.err"; then
+        cat "$WORK_DIR/manual-check.err" >&2
+        cp -p "$backup/gost.yml" "$CONFIG_FILE"
+        die 'YAML 配置校验失败，已恢复原配置。'
+    fi
+    if ! reload_service; then
+        cp -p "$backup/gost.yml" "$CONFIG_FILE"
+        systemctl reload gost || true
+        die '热加载失败，已恢复原配置；请检查日志。'
+    fi
+    ok '手工配置已保存。'
+}
+
+edit_rule() {
+    local mode choice old_name old_row old_proto old_listen old_port old_target old_target_port
+    local name proto listen port target target_port input staged
+    require_gost
+    ensure_files
+    printf '\n修改现有转发规则\n  1) 修改脚本创建的规则（逐项修改，回车保留原值）\n  2) 修改手工规则（编辑 YAML，自动备份与校验）\n  0) 返回\n'
+    read -r -p '请选择 [1/2/0]：' mode || return 0
+    case $mode in
+        1) ;;
+        2) edit_manual_yaml; return ;;
+        0|'') info '已取消。'; return ;;
+        *) die '无效选项。' ;;
+    esac
+    if [[ ! -s $RULES_FILE ]]; then
+        warn '暂无脚本创建的规则；如果是原来手工写入的服务，请选择手工 YAML 编辑模式。'
+        return 0
+    fi
+    printf '\n当前可修改规则：\n'
+    awk -F '\t' 'NF == 6 && $1 !~ /^#/ {i++; printf " %2d) %-20s %-5s %s:%s -> %s:%s\n", i, $1, $2, $3, $4, $5, $6}' "$RULES_FILE"
+    read -r -p '输入规则编号或规则名（0 返回）：' choice || return 0
+    [[ $choice != 0 && -n $choice ]] || return 0
+    if [[ $choice =~ ^[0-9]+$ ]]; then
+        old_name=$(awk -F '\t' -v n="$choice" 'NF == 6 && $1 !~ /^#/ {i++; if (i == n) {print $1; exit}}' "$RULES_FILE")
+    else
+        old_name=$choice
+    fi
+    [[ $old_name =~ ^[a-zA-Z0-9_-]{1,48}$ ]] || die '找不到有效的规则名。'
+    old_row=$(awk -F '\t' -v n="$old_name" '$1 == n {print; exit}' "$RULES_FILE")
+    [[ -n $old_row ]] || die "规则不存在：$old_name。手工规则请使用菜单 2。"
+    IFS=$'\t' read -r _ old_proto old_listen old_port old_target old_target_port <<< "$old_row"
+    printf '\n当前配置：%s [%s] %s:%s -> %s:%s\n' "$old_name" "$old_proto" "$old_listen" "$old_port" "$old_target" "$old_target_port"
+    printf '直接回车保留原值。\n'
+
+    read -r -p "规则名称 [$old_name]：" input || return 0
+    name=${input:-$old_name}
+    [[ $name =~ ^[a-zA-Z0-9_-]{1,48}$ ]] || die '规则名无效。'
+    if [[ $name != "$old_name" ]] && cut -f1 "$RULES_FILE" | grep -Fxq -- "$name"; then
+        die "规则名 $name 已存在。"
+    fi
+
+    read -r -p "监听 IP [$old_listen]：" input || return 0
+    listen=${input:-$old_listen}
+    valid_host "$listen" || die '监听地址格式不合法。'
+    if [[ $listen == 0.0.0.0 || $listen == :: || $listen == '[::]' ]]; then
+        ask_yes '监听所有网卡可能暴露公网端口，确定吗？' || { info '已取消。'; return; }
+    fi
+
+    read -r -p "监听端口 [$old_port]：" input || return 0
+    port=${input:-$old_port}
+    valid_port "$port" || die '监听端口无效。'
+
+    read -r -p "目标 IP 或域名 [$old_target]：" input || return 0
+    target=${input:-$old_target}
+    valid_host "$target" || die '目标地址格式不合法。'
+
+    read -r -p "目标端口 [$old_target_port]：" input || return 0
+    target_port=${input:-$old_target_port}
+    valid_port "$target_port" || die '目标端口无效。'
+
+    read -r -p "协议 [tcp/udp/both] (当前 $old_proto，回车保留)：" input || return 0
+    case ${input:-$old_proto} in
+        1|tcp|TCP) proto=tcp ;;
+        2|udp|UDP) proto=udp ;;
+        3|both|BOTH) proto=both ;;
+        *) die '协议无效，只能是 tcp、udp 或 both。' ;;
+    esac
+
+    # Ignore the old manager-owned service(s) while checking the candidate ports.
+    if [[ $proto == both ]]; then
+        check_conflicts "$listen" "$port" tcp "$old_name" || die '新 TCP 监听与现有规则冲突。'
+        check_conflicts "$listen" "$port" udp "$old_name" || die '新 UDP 监听与现有规则冲突。'
+    else
+        check_conflicts "$listen" "$port" "$proto" "$old_name" || die '新监听与现有规则冲突。'
+    fi
+
+    if [[ $name == "$old_name" && $proto == "$old_proto" && $listen == "$old_listen" && $port == "$old_port" && $target == "$old_target" && $target_port == "$old_target_port" ]]; then
+        info '规则未发生变化，无需热加载。'
+        return 0
+    fi
+    printf '\n变更前：%s [%s] %s:%s -> %s:%s\n' "$old_name" "$old_proto" "$old_listen" "$old_port" "$old_target" "$old_target_port"
+    printf '变更后：%s [%s] %s:%s -> %s:%s\n' "$name" "$proto" "$listen" "$port" "$target" "$target_port"
+    ask_yes '确定保存并热加载吗？' || { info '已取消。'; return; }
+
+    staged="$WORK_DIR/rules-edit.tsv"
+    awk -F '\t' -v OFS='\t' -v old="$old_name" -v new="$name" -v p="$proto" -v a="$listen" -v lp="$port" -v dest="$target" -v rp="$target_port" '
+        $1 == old { $1 = new; $2 = p; $3 = a; $4 = lp; $5 = dest; $6 = rp }
+        { print }
+    ' "$RULES_FILE" >"$staged"
     apply_staged_rules "$staged"
 }
 
@@ -659,6 +793,7 @@ menu() {
   8) 实时查看日志
   9) 重启 GOST 服务（将中断连接）
  10) 查看配置备份 / 恢复备份
+ 11) 修改现有转发规则
   0) 退出
 =======================================
 MENU
@@ -674,8 +809,9 @@ MENU
             8) run_menu_action '实时查看日志' show_live_logs ;;
             9) run_menu_action '重启服务' restart_service_interactive ;;
             10) run_menu_action '备份/恢复配置' restore_backup ;;
+            11) run_menu_action '修改现有转发规则' edit_rule ;;
             0) refresh_screen; info '已退出 GOST 管理器。'; break ;;
-            *) run_menu_action '无效选项' warn '请输入 0–10 之间的菜单编号。' ;;
+            *) run_menu_action '无效选项' warn '请输入 0–11 之间的菜单编号。' ;;
         esac
     done
 }
