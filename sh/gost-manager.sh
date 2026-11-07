@@ -6,6 +6,9 @@
 set -Eeuo pipefail
 umask 077
 
+# Version of this management script (independent from the installed GOST binary version).
+SCRIPT_VERSION="1.1.0"
+
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
 RULES_FILE=$CONFIG_DIR/gost-manager.rules
@@ -23,10 +26,11 @@ die()  { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 ask_yes() { local ans; [[ -t 0 ]] || { warn "非交互模式：跳过需要确认的操作：$1"; return 1; }; read -r -p "$1 [y/N]: " ans || return 1; [[ $ans == [yY] || $ans == [yY][eE][sS] ]]; }
 
 usage() {
+    printf 'GOST 管理器 v%s\n' "$SCRIPT_VERSION"
     cat <<'HELP'
 GOST v3 安装及 TCP/UDP 转发管理（Debian/Ubuntu + systemd）
-用法：sudo bash gost-manager.sh [--install|--list|--status|--reload|--help]
-不带参数：显示安装版本、systemd 状态及交互式菜单。
+用法：sudo bash gost-manager.sh [--install|--list|--status|--reload|--version|--help]
+不带参数：单屏交互式菜单，操作结束按 Enter 返回主菜单。
 
 规则管理：添加 TCP、UDP 或两者同时转发；只删除本脚本创建的规则。
 安全设计：下载官方最新稳定版本，校验 SHA256；修改前备份配置；
@@ -38,6 +42,7 @@ HELP
 }
 
 [[ ${1:-} == --help || ${1:-} == -h ]] && { usage; exit 0; }
+[[ ${1:-} == --version || ${1:-} == -v ]] && { printf 'gost-manager v%s\n' "$SCRIPT_VERSION"; exit 0; }
 (( EUID == 0 )) || die '请使用 root 运行。'
 [[ $(uname -s) == Linux ]] || die '仅支持 Linux。'
 [[ -d /run/systemd/system ]] || warn '没有检测到正在运行的 systemd；安装服务和热加载可能不可用。'
@@ -591,13 +596,59 @@ restore_backup() {
     ok "已恢复备份：$stamp"
 }
 
+# Redraw inside the same terminal viewport. No escape sequences when output is redirected.
+refresh_screen() {
+    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_CLEAR:-} ]]; then
+        printf '\033[H\033[2J'
+    fi
+}
+
+# A command gets its own screen. After it finishes, retain its output until Enter.
+# Run the action in a subshell so die/exit does not close the interactive manager.
+run_menu_action() {
+    local title=$1 result=0
+    shift
+    refresh_screen
+    printf '========== %s | gost-manager v%s ==========\n\n' "$title" "$SCRIPT_VERSION"
+    # Invoke the subshell as a simple command, not an if test:
+    # this preserves errexit inside install/configuration functions.
+    set +e
+    ( set -Eeuo pipefail; "$@" )
+    result=$?
+    set -e
+    if (( result != 0 )); then
+        warn "操作未完成（退出码 $result），请查看上方提示。"
+    fi
+    if [[ -t 0 ]]; then
+        printf '\n'
+        read -r -p '按 Enter 返回主菜单...' _ || true
+    fi
+}
+
+restart_service_interactive() {
+    if ask_yes '确定重启 GOST？现有连接将被断开。'; then
+        systemctl restart gost
+        ok 'GOST 已重启。'
+    else
+        info '已取消重启。'
+    fi
+}
+
+show_live_logs() {
+    printf '实时日志（按 Ctrl+C 停止查看并返回菜单）\n\n'
+    # Trap SIGINT in this subshell so Ctrl+C stops journalctl, not the menu.
+    trap ':' INT
+    journalctl -u gost -f -n 30 || true
+    trap - INT
+}
+
 menu() {
     local choice
     while true; do
+        refresh_screen
         show_brief_status
+        printf '\n========== GOST 管理器 v%s ==========\n' "$SCRIPT_VERSION"
         cat <<'MENU'
-
-========== GOST v3 管理 ==========
   1) 安装/更新 GOST 官方稳定版
   2) 安装/启用 systemd 服务（保留原配置）
   3) 新增 TCP / UDP / 双协议转发
@@ -609,22 +660,22 @@ menu() {
   9) 重启 GOST 服务（将中断连接）
  10) 查看配置备份 / 恢复备份
   0) 退出
-=================================
+=======================================
 MENU
         read -r -p '选择操作：' choice || break
         case $choice in
-            1) install_binary ;;
-            2) install_service ;;
-            3) add_rule ;;
-            4) remove_rule ;;
-            5) list_rules ;;
-            6) reload_service ;;
-            7) status ;;
-            8) journalctl -u gost -f -n 30 || true ;;
-            9) if ask_yes '确定重启？现有连接将被断开。'; then systemctl restart gost; fi ;;
-            10) restore_backup ;;
-            0) break ;;
-            *) warn '无效选项。' ;;
+            1) run_menu_action '安装/更新 GOST' install_binary ;;
+            2) run_menu_action '启用 systemd 服务' install_service ;;
+            3) run_menu_action '新增 TCP/UDP 转发' add_rule ;;
+            4) run_menu_action '删除转发规则' remove_rule ;;
+            5) run_menu_action '查看全部转发规则' list_rules ;;
+            6) run_menu_action '校验配置并热加载' reload_service ;;
+            7) run_menu_action '查看 GOST 运行状态' status ;;
+            8) run_menu_action '实时查看日志' show_live_logs ;;
+            9) run_menu_action '重启服务' restart_service_interactive ;;
+            10) run_menu_action '备份/恢复配置' restore_backup ;;
+            0) refresh_screen; info '已退出 GOST 管理器。'; break ;;
+            *) run_menu_action '无效选项' warn '请输入 0–10 之间的菜单编号。' ;;
         esac
     done
 }
