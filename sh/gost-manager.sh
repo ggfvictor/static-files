@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 # Version of this management script (independent from the installed GOST binary version).
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
@@ -808,10 +808,10 @@ show_live_logs() {
     trap - INT
 }
 
-# Group headings align with the first digit of normal menu items (four-space indent).
-# Keep titles left-aligned; centered headings disrupt the menu's reading order.
+# Match the two-space left edge of the dashboard and separator.
+# Menu descriptions use fixed-width numeric prefixes to align after both 1- and 2-digit choices.
 print_menu_heading() {
-    printf '\n    '
+    printf '\n  '
     status_value cyan "$1"
     printf '\n'
 }
@@ -823,26 +823,26 @@ menu() {
         show_brief_status
         print_menu_heading '[ 转发规则 ]'
         cat <<'MENU'
-    1) 查看全部转发规则
-    2) 新增 TCP/UDP 规则
-    3) 修改现有转发规则
-    4) 删除管理器规则
-    5) 校验配置并热加载
+  1)  查看全部转发规则
+  2)  新增 TCP/UDP 规则
+  3)  修改现有转发规则
+  4)  删除管理器规则
+  5)  校验配置并热加载
 MENU
         print_menu_heading '[ 服务管理 ]'
         cat <<'MENU'
-    6) 安装/更新 GOST
-    7) 安装/启用 systemd
-    8) 重启 GOST 服务
+  6)  安装/更新 GOST
+  7)  安装/启用 systemd
+  8)  重启 GOST 服务
 MENU
         print_menu_heading '[ 诊断与维护 ]'
         cat <<'MENU'
-    9) 查看详细状态与端口
-   10) 实时查看日志
-   11) 查看备份/恢复配置
+  9)  查看详细状态与端口
+  10) 实时查看日志
+  11) 查看备份/恢复配置
 MENU
         printf '  ------------------------------------------\n'
-        printf '    0) 退出\n\n'
+        printf '  0)  退出\n\n'
         read -r -p '  请选择编号 [0-11]：' choice || break
         case $choice in
             1) run_menu_action '查看全部转发规则' list_rules ;;
