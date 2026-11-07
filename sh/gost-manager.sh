@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 # Version of this management script (independent from the installed GOST binary version).
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.3.3"
 
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
@@ -808,15 +808,11 @@ show_live_logs() {
     trap - INT
 }
 
-# Center group headings relative to the 42-column separators, not the entire SSH window.
-# Visible cell widths include brackets/spaces; each CJK character occupies two columns.
-# Passing explicit widths avoids incorrect Bash byte counts with non-UTF-8 locales.
+# Group headings align with the first digit of normal menu items (four-space indent).
+# Keep titles left-aligned; centered headings disrupt the menu's reading order.
 print_menu_heading() {
-    local label=$1 visible_cells=$2
-    local content_width=42
-    local left_padding=$((2 + (content_width - visible_cells) / 2))
-    printf '\n%*s' "$left_padding" ''
-    status_value cyan "$label"
+    printf '\n    '
+    status_value cyan "$1"
     printf '\n'
 }
 
@@ -825,7 +821,7 @@ menu() {
     while true; do
         refresh_screen
         show_brief_status
-        print_menu_heading '[ 转发规则 ]' 12
+        print_menu_heading '[ 转发规则 ]'
         cat <<'MENU'
     1) 查看全部转发规则
     2) 新增 TCP/UDP 规则
@@ -833,13 +829,13 @@ menu() {
     4) 删除管理器规则
     5) 校验配置并热加载
 MENU
-        print_menu_heading '[ 服务管理 ]' 12
+        print_menu_heading '[ 服务管理 ]'
         cat <<'MENU'
     6) 安装/更新 GOST
     7) 安装/启用 systemd
     8) 重启 GOST 服务
 MENU
-        print_menu_heading '[ 诊断与维护 ]' 14
+        print_menu_heading '[ 诊断与维护 ]'
         cat <<'MENU'
     9) 查看详细状态与端口
    10) 实时查看日志
