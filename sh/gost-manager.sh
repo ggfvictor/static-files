@@ -80,46 +80,73 @@ require_gost() {
 }
 
 # 仅查询状态，不修改系统配置；每次重新显示菜单时刷新。
+# 仅在交互式终端显示 ANSI 颜色；管道/重定向或 NO_COLOR 时输出纯文本。
+status_value() {
+    local color=$1 value=$2 prefix='' suffix=''
+    if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+        case $color in
+            green)  prefix=$'\033[32m' ;;
+            red)    prefix=$'\033[31m' ;;
+            yellow) prefix=$'\033[33m' ;;
+            cyan)   prefix=$'\033[36m' ;;
+        esac
+        [[ -z $prefix ]] || suffix=$'\033[0m'
+    fi
+    printf '%s%s%s' "$prefix" "$value" "$suffix"
+}
+
+status_field() {
+    printf '%s：' "$1"
+    status_value "$2" "$3"
+    printf '\n'
+}
+
 show_brief_status() {
     local bin installed_version unit_state enabled active pid
     bin=$(find_gost)
     printf '\n------------ 当前 GOST 状态 ------------\n'
     if [[ -n $bin && -x $bin ]]; then
         if installed_version=$(get_gost_version "$bin"); then
-            printf '程序安装：已安装  v%s\n' "$installed_version"
+            status_field '程序安装' green "已安装 v${installed_version}"
         else
-            printf '程序安装：发现文件，但版本无法识别\n'
+            status_field '程序安装' yellow '发现文件，但版本无法识别'
         fi
         printf '程序路径：%s\n' "$bin"
     else
-        printf '程序安装：未安装\n'
+        status_field '程序安装' red '未安装'
     fi
     unit_state=$(systemctl show gost.service -p LoadState --value 2>/dev/null || true)
     if [[ -z $unit_state || $unit_state == not-found ]]; then
-        printf 'systemd 服务：未安装\n'
-        printf '开机自启：未启用\n'
-        printf '运行状态：未运行\n'
+        status_field 'systemd 服务' red '未安装'
+        status_field '开机自启' red '未启用'
+        status_field '运行状态' red '未运行'
     else
-        printf 'systemd 服务：已安装（%s）\n' "$unit_state"
+        if [[ $unit_state == loaded ]]; then
+            status_field 'systemd 服务' green '已安装（loaded）'
+        else
+            status_field 'systemd 服务' yellow "状态异常（${unit_state}）"
+        fi
         enabled=$(systemctl is-enabled gost.service 2>/dev/null || true)
         active=$(systemctl is-active gost.service 2>/dev/null || true)
         case $enabled in
-            enabled) printf '开机自启：已启用\n' ;;
-            *) printf '开机自启：未启用（%s）\n' "${enabled:-unknown}" ;;
+            enabled) status_field '开机自启' green '已启用' ;;
+            disabled|masked) status_field '开机自启' red "未启用（${enabled}）" ;;
+            *) status_field '开机自启' yellow "非启用状态（${enabled:-unknown}）" ;;
         esac
         case $active in
             active)
-                printf '运行状态：运行中（active）\n'
+                status_field '运行状态' green '运行中（active）'
                 pid=$(systemctl show gost.service -p MainPID --value 2>/dev/null || true)
                 [[ $pid =~ ^[1-9][0-9]*$ ]] && printf '主进程 PID：%s\n' "$pid"
                 ;;
-            *) printf '运行状态：未运行（%s）\n' "${active:-unknown}" ;;
+            failed|inactive) status_field '运行状态' red "未运行（${active}）" ;;
+            *) status_field '运行状态' yellow "未就绪（${active:-unknown}）" ;;
         esac
     fi
     if [[ -f $CONFIG_FILE ]]; then
-        printf '配置文件：已存在（%s）\n' "$CONFIG_FILE"
+        status_field '配置文件' green "已存在（${CONFIG_FILE}）"
     else
-        printf '配置文件：未创建\n'
+        status_field '配置文件' yellow '未创建'
     fi
     printf '%s\n' '---------------------------------------'
 }
