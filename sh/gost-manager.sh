@@ -26,7 +26,7 @@ usage() {
     cat <<'HELP'
 GOST v3 安装及 TCP/UDP 转发管理（Debian/Ubuntu + systemd）
 用法：sudo bash gost-manager.sh [--install|--list|--status|--reload|--help]
-不带参数：显示交互式菜单。
+不带参数：显示安装版本、systemd 状态及交互式菜单。
 
 规则管理：添加 TCP、UDP 或两者同时转发；只删除本脚本创建的规则。
 安全设计：下载官方最新稳定版本，校验 SHA256；修改前备份配置；
@@ -59,10 +59,69 @@ find_gost() {
     fi
 }
 
+# 官方 v3.3.3 的 `-V` 输出是 `gost 3.3.3 (go... linux/amd64)`，没有 v 前缀。
+# 单独解析版本，供安装校验、版本检查和状态展示共用。
+get_gost_version() {
+    local output
+    output=$("$1" -V 2>&1) || return 1
+    if [[ $output =~ ^gost[[:space:]]+v?([0-9]+\.[0-9]+\.[0-9]+)([+.-][^[:space:]]+)?([[:space:]]|$) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+}
+
 require_gost() {
+    local installed_version
     GOST_BIN=$(find_gost)
     [[ -n $GOST_BIN && -x $GOST_BIN ]] || die '尚未安装 GOST，请先选择菜单 1。'
-    "$GOST_BIN" -V 2>&1 | grep -q 'v3\.' || die '当前 GOST 不是 v3，请先升级。'
+    installed_version=$(get_gost_version "$GOST_BIN") || die "无法识别 GOST 版本：$GOST_BIN，请检查 gost -V。"
+    [[ $installed_version == 3.* ]] || die "当前 GOST 版本为 $installed_version，不是 v3，请先升级。"
+}
+
+# 仅查询状态，不修改系统配置；每次重新显示菜单时刷新。
+show_brief_status() {
+    local bin installed_version unit_state enabled active pid
+    bin=$(find_gost)
+    printf '\n------------ 当前 GOST 状态 ------------\n'
+    if [[ -n $bin && -x $bin ]]; then
+        if installed_version=$(get_gost_version "$bin"); then
+            printf '程序安装：已安装  v%s\n' "$installed_version"
+        else
+            printf '程序安装：发现文件，但版本无法识别\n'
+        fi
+        printf '程序路径：%s\n' "$bin"
+    else
+        printf '程序安装：未安装\n'
+    fi
+    unit_state=$(systemctl show gost.service -p LoadState --value 2>/dev/null || true)
+    if [[ -z $unit_state || $unit_state == not-found ]]; then
+        printf 'systemd 服务：未安装\n'
+        printf '开机自启：未启用\n'
+        printf '运行状态：未运行\n'
+    else
+        printf 'systemd 服务：已安装（%s）\n' "$unit_state"
+        enabled=$(systemctl is-enabled gost.service 2>/dev/null || true)
+        active=$(systemctl is-active gost.service 2>/dev/null || true)
+        case $enabled in
+            enabled) printf '开机自启：已启用\n' ;;
+            *) printf '开机自启：未启用（%s）\n' "${enabled:-unknown}" ;;
+        esac
+        case $active in
+            active)
+                printf '运行状态：运行中（active）\n'
+                pid=$(systemctl show gost.service -p MainPID --value 2>/dev/null || true)
+                [[ $pid =~ ^[1-9][0-9]*$ ]] && printf '主进程 PID：%s\n' "$pid"
+                ;;
+            *) printf '运行状态：未运行（%s）\n' "${active:-unknown}" ;;
+        esac
+    fi
+    if [[ -f $CONFIG_FILE ]]; then
+        printf '配置文件：已存在（%s）\n' "$CONFIG_FILE"
+    else
+        printf '配置文件：未创建\n'
+    fi
+    printf '%s\n' '---------------------------------------'
 }
 
 ensure_files() {
@@ -135,7 +194,9 @@ install_binary() {
         die '解压后找不到 gost 可执行文件。'
     fi
     chmod 755 "$bin_dir"
-    "$bin_dir" -V 2>&1 | grep -q "v${version}" || die '下载程序版本与 Release 不符。'
+    local detected_version
+    detected_version=$(get_gost_version "$bin_dir") || die '下载程序无法执行或版本输出无法识别。'
+    [[ $detected_version == "$version" ]] || die "下载程序版本不符：预期 $version，实际 $detected_version。"
     if [[ -e $BIN_TARGET ]]; then
         mkdir -p "$BACKUP_DIR/binaries"
         cp -p "$BIN_TARGET" "$BACKUP_DIR/binaries/gost.$(date -u +%Y%m%dT%H%M%S).bak"
@@ -461,6 +522,7 @@ remove_rule() {
 }
 
 status() {
+    show_brief_status
     local bin
     bin=$(find_gost)
     if [[ -n $bin ]]; then
@@ -505,6 +567,7 @@ restore_backup() {
 menu() {
     local choice
     while true; do
+        show_brief_status
         cat <<'MENU'
 
 ========== GOST v3 管理 ==========
