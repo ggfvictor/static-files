@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 # Version of this management script (independent from the installed GOST binary version).
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
@@ -30,9 +30,9 @@ usage() {
     cat <<'HELP'
 GOST v3 安装及 TCP/UDP 转发管理（Debian/Ubuntu + systemd）
 用法：sudo bash gost-manager.sh [--install|--list|--status|--reload|--version|--help]
-不带参数：单屏交互式菜单，操作结束按 Enter 返回主菜单。
+不带参数：按规则管理、服务管理、维护诊断分组显示单屏菜单。
 
-规则管理：添加、修改、删除 TCP/UDP/双协议转发；脚本规则可逐项修改，手工规则可安全编辑 YAML。
+规则管理：查看、新增、修改、删除 TCP/UDP 转发，支持配置校验与热加载。
 安全设计：下载官方最新稳定版本，校验 SHA256；修改前备份配置；
           通过 SIGHUP 热加载；不覆盖现有 systemd 服务文件或手工规则。
 配置位置：/etc/gost/gost.yml
@@ -79,7 +79,7 @@ get_gost_version() {
 require_gost() {
     local installed_version
     GOST_BIN=$(find_gost)
-    [[ -n $GOST_BIN && -x $GOST_BIN ]] || die '尚未安装 GOST，请先选择菜单 1。'
+    [[ -n $GOST_BIN && -x $GOST_BIN ]] || die '尚未安装 GOST，请在「服务管理」中选择安装 GOST。'
     installed_version=$(get_gost_version "$GOST_BIN") || die "无法识别 GOST 版本：$GOST_BIN，请检查 gost -V。"
     [[ $installed_version == 3.* ]] || die "当前 GOST 版本为 $installed_version，不是 v3，请先升级。"
 }
@@ -106,54 +106,86 @@ status_field() {
     printf '\n'
 }
 
-show_brief_status() {
-    local bin installed_version unit_state enabled active pid
-    bin=$(find_gost)
-    printf '\n------------ 当前 GOST 状态 ------------\n'
-    if [[ -n $bin && -x $bin ]]; then
-        if installed_version=$(get_gost_version "$bin"); then
-            status_field '程序安装' green "已安装 v${installed_version}"
-        else
-            status_field '程序安装' yellow '发现文件，但版本无法识别'
-        fi
-        printf '程序路径：%s\n' "$bin"
-    else
-        status_field '程序安装' red '未安装'
+# Both manual and manager-created services contribute to the total service count.
+# Parsing via GOST ensures that multiline YAML and hand-written rules are counted correctly.
+get_service_count() {
+    local bin=$1 count
+    if [[ ! -f $CONFIG_FILE || -z $bin ]]; then
+        printf '%s' '--'
+        return 0
     fi
+    if count=$("$bin" -C "$CONFIG_FILE" -O json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(len(data.get("services") or []))
+except Exception:
+    sys.exit(1)
+' 2>/dev/null); then
+        printf '%s' "$count"
+    else
+        printf '%s' '?'
+    fi
+}
+
+show_brief_status() {
+    local bin ver gtext gcolor unit_state service_text service_color
+    local enabled active pid auto_text auto_color conf_text conf_color
+    local managed_count total_count
+    bin=$(find_gost)
+    if [[ -n $bin && -x $bin ]]; then
+        if ver=$(get_gost_version "$bin"); then
+            gtext="已安装 v$ver"; gcolor=green
+        else
+            gtext='版本无法识别'; gcolor=yellow
+        fi
+    else
+        gtext='未安装'; gcolor=red
+    fi
+
     unit_state=$(systemctl show gost.service -p LoadState --value 2>/dev/null || true)
     if [[ -z $unit_state || $unit_state == not-found ]]; then
-        status_field 'systemd 服务' red '未安装'
-        status_field '开机自启' red '未启用'
-        status_field '运行状态' red '未运行'
+        service_text='未安装'; service_color=red
+        auto_text='未启用'; auto_color=red
     else
-        if [[ $unit_state == loaded ]]; then
-            status_field 'systemd 服务' green '已安装（loaded）'
-        else
-            status_field 'systemd 服务' yellow "状态异常（${unit_state}）"
-        fi
-        enabled=$(systemctl is-enabled gost.service 2>/dev/null || true)
         active=$(systemctl is-active gost.service 2>/dev/null || true)
-        case $enabled in
-            enabled) status_field '开机自启' green '已启用' ;;
-            disabled|masked) status_field '开机自启' red "未启用（${enabled}）" ;;
-            *) status_field '开机自启' yellow "非启用状态（${enabled:-unknown}）" ;;
-        esac
         case $active in
             active)
-                status_field '运行状态' green '运行中（active）'
                 pid=$(systemctl show gost.service -p MainPID --value 2>/dev/null || true)
-                [[ $pid =~ ^[1-9][0-9]*$ ]] && printf '主进程 PID：%s\n' "$pid"
-                ;;
-            failed|inactive) status_field '运行状态' red "未运行（${active}）" ;;
-            *) status_field '运行状态' yellow "未就绪（${active:-unknown}）" ;;
+                service_text='运行中'
+                [[ $pid =~ ^[1-9][0-9]*$ ]] && service_text="运行中 (PID $pid)"
+                service_color=green ;;
+            failed|inactive)
+                service_text="未运行 ($active)"; service_color=red ;;
+            *) service_text="待就绪 (${active:-unknown})"; service_color=yellow ;;
+        esac
+        [[ $unit_state == loaded ]] || { service_text="systemd ${unit_state}"; service_color=yellow; }
+        enabled=$(systemctl is-enabled gost.service 2>/dev/null || true)
+        case $enabled in
+            enabled) auto_text='已启用'; auto_color=green ;;
+            disabled|masked) auto_text="未启用 ($enabled)"; auto_color=red ;;
+            *) auto_text="其他状态 (${enabled:-unknown})"; auto_color=yellow ;;
         esac
     fi
     if [[ -f $CONFIG_FILE ]]; then
-        status_field '配置文件' green "已存在（${CONFIG_FILE}）"
+        conf_text='已存在'; conf_color=green
     else
-        status_field '配置文件' yellow '未创建'
+        conf_text='未创建'; conf_color=yellow
     fi
-    printf '%s\n' '---------------------------------------'
+    managed_count=0
+    if [[ -f $RULES_FILE ]]; then
+        managed_count=$(awk -F '\t' 'NF == 6 && $1 !~ /^#/ {n++} END {print n+0}' "$RULES_FILE" 2>/dev/null) || managed_count='?'
+    fi
+    total_count=$(get_service_count "$bin")
+    printf '\n  GOST Manager  v%s\n' "$SCRIPT_VERSION"
+    printf '  -------------------------------------------------------\n'
+    printf '  GOST  '; status_value "$gcolor" "$gtext"
+    printf '   |  服务  '; status_value "$service_color" "$service_text"; printf '\n'
+    printf '  自启  '; status_value "$auto_color" "$auto_text"
+    printf '       |  配置  '; status_value "$conf_color" "$conf_text"; printf '\n'
+    printf '  转发  '; status_value cyan "${total_count} 个服务"
+    printf '   |  管理器规则  '; status_value cyan "${managed_count} 组"; printf '\n'
+    printf '  -------------------------------------------------------\n'
 }
 
 ensure_files() {
@@ -781,37 +813,38 @@ menu() {
     while true; do
         refresh_screen
         show_brief_status
-        printf '\n========== GOST 管理器 v%s ==========\n' "$SCRIPT_VERSION"
         cat <<'MENU'
-  1) 安装/更新 GOST 官方稳定版
-  2) 安装/启用 systemd 服务（保留原配置）
-  3) 新增 TCP / UDP / 双协议转发
-  4) 删除本脚本创建的转发规则
-  5) 查看全部转发规则
-  6) 校验配置并热加载
-  7) 查看 GOST 状态和监听端口
-  8) 实时查看日志
-  9) 重启 GOST 服务（将中断连接）
- 10) 查看配置备份 / 恢复备份
- 11) 修改现有转发规则
+ [ 转发规则 ]
+  1) 查看全部规则            2) 新增规则
+  3) 修改现有规则            4) 删除管理器规则
+  5) 校验配置并热加载
+
+ [ 服务管理 ]
+  6) 安装/更新 GOST          7) 安装/启用 systemd
+  8) 重启 GOST 服务
+
+ [ 诊断与维护 ]
+  9) 详细状态/端口          10) 实时日志
+ 11) 查看备份/恢复配置
+
   0) 退出
-=======================================
+ =======================================================
 MENU
-        read -r -p '选择操作：' choice || break
+        read -r -p '请选择 [0-11]：' choice || break
         case $choice in
-            1) run_menu_action '安装/更新 GOST' install_binary ;;
-            2) run_menu_action '启用 systemd 服务' install_service ;;
-            3) run_menu_action '新增 TCP/UDP 转发' add_rule ;;
+            1) run_menu_action '查看全部转发规则' list_rules ;;
+            2) run_menu_action '新增 TCP/UDP 转发' add_rule ;;
+            3) run_menu_action '修改现有转发规则' edit_rule ;;
             4) run_menu_action '删除转发规则' remove_rule ;;
-            5) run_menu_action '查看全部转发规则' list_rules ;;
-            6) run_menu_action '校验配置并热加载' reload_service ;;
-            7) run_menu_action '查看 GOST 运行状态' status ;;
-            8) run_menu_action '实时查看日志' show_live_logs ;;
-            9) run_menu_action '重启服务' restart_service_interactive ;;
-            10) run_menu_action '备份/恢复配置' restore_backup ;;
-            11) run_menu_action '修改现有转发规则' edit_rule ;;
+            5) run_menu_action '校验配置并热加载' reload_service ;;
+            6) run_menu_action '安装/更新 GOST' install_binary ;;
+            7) run_menu_action '安装/启用 systemd' install_service ;;
+            8) run_menu_action '重启 GOST 服务' restart_service_interactive ;;
+            9) run_menu_action '查看详细状态' status ;;
+            10) run_menu_action '实时查看日志' show_live_logs ;;
+            11) run_menu_action '查看备份/恢复配置' restore_backup ;;
             0) refresh_screen; info '已退出 GOST 管理器。'; break ;;
-            *) run_menu_action '无效选项' warn '请输入 0–11 之间的菜单编号。' ;;
+            *) run_menu_action '无效选项' warn '请输入 0-11 之间的菜单编号。' ;;
         esac
     done
 }
