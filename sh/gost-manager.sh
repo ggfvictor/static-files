@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 # Version of this management script (independent from the installed GOST binary version).
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
@@ -177,15 +177,15 @@ show_brief_status() {
         managed_count=$(awk -F '\t' 'NF == 6 && $1 !~ /^#/ {n++} END {print n+0}' "$RULES_FILE" 2>/dev/null) || managed_count='?'
     fi
     total_count=$(get_service_count "$bin")
+    # 同宽标签：GOST（4 列）与两字中文标签（4 列）天然对齐，无需计算字符宽度。
     printf '\n  GOST Manager  v%s\n' "$SCRIPT_VERSION"
-    printf '  -------------------------------------------------------\n'
-    printf '  GOST  '; status_value "$gcolor" "$gtext"
-    printf '   |  服务  '; status_value "$service_color" "$service_text"; printf '\n'
-    printf '  自启  '; status_value "$auto_color" "$auto_text"
-    printf '       |  配置  '; status_value "$conf_color" "$conf_text"; printf '\n'
-    printf '  转发  '; status_value cyan "${total_count} 个服务"
-    printf '   |  管理器规则  '; status_value cyan "${managed_count} 组"; printf '\n'
-    printf '  -------------------------------------------------------\n'
+    printf '  ------------------------------------------\n'
+    printf '  GOST  '; status_value "$gcolor" "$gtext"; printf '\n'
+    printf '  服务  '; status_value "$service_color" "$service_text"; printf '\n'
+    printf '  自启  '; status_value "$auto_color" "$auto_text"; printf '\n'
+    printf '  配置  '; status_value "$conf_color" "$conf_text"; printf '\n'
+    printf '  规则  '; status_value cyan "${total_count} 个服务 / ${managed_count} 组管理器规则"; printf '\n'
+    printf '  ------------------------------------------\n'
 }
 
 ensure_files() {
@@ -813,24 +813,29 @@ menu() {
     while true; do
         refresh_screen
         show_brief_status
+        printf '\n  '; status_value cyan '[ 转发规则 ]'; printf '\n'
         cat <<'MENU'
- [ 转发规则 ]
-  1) 查看全部规则            2) 新增规则
-  3) 修改现有规则            4) 删除管理器规则
-  5) 校验配置并热加载
-
- [ 服务管理 ]
-  6) 安装/更新 GOST          7) 安装/启用 systemd
-  8) 重启 GOST 服务
-
- [ 诊断与维护 ]
-  9) 详细状态/端口          10) 实时日志
- 11) 查看备份/恢复配置
-
-  0) 退出
- =======================================================
+    1) 查看全部转发规则
+    2) 新增 TCP/UDP 规则
+    3) 修改现有转发规则
+    4) 删除管理器规则
+    5) 校验配置并热加载
 MENU
-        read -r -p '请选择 [0-11]：' choice || break
+        printf '\n  '; status_value cyan '[ 服务管理 ]'; printf '\n'
+        cat <<'MENU'
+    6) 安装/更新 GOST
+    7) 安装/启用 systemd
+    8) 重启 GOST 服务
+MENU
+        printf '\n  '; status_value cyan '[ 诊断与维护 ]'; printf '\n'
+        cat <<'MENU'
+    9) 查看详细状态与端口
+   10) 实时查看日志
+   11) 查看备份/恢复配置
+MENU
+        printf '  ------------------------------------------\n'
+        printf '    0) 退出\n\n'
+        read -r -p '  请选择编号 [0-11]：' choice || break
         case $choice in
             1) run_menu_action '查看全部转发规则' list_rules ;;
             2) run_menu_action '新增 TCP/UDP 转发' add_rule ;;
