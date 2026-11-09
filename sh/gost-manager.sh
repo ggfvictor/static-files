@@ -369,7 +369,7 @@ if begins:
         for row in path.read_text(encoding='utf-8').splitlines():
             if not row or row.startswith('#'):
                 continue
-            parts = row.split('\\t')
+            parts = row.split(chr(9))
             if len(parts) != 6 or parts[1] not in ('tcp', 'udp', 'both'):
                 sys.exit('错误：管理器规则索引损坏，请先恢复备份。')
             name, proto = parts[0], parts[1]
@@ -382,7 +382,7 @@ if begins:
     old_block = lines[begins[0]+1:ends[0]]
     old_names = []
     for entry in old_block:
-        match = re.match(r'^  - name:\s*[\\x22\\x27]?([A-Za-z0-9_-]+)[\\x22\\x27]?\s*(?:#.*)?$', entry.rstrip('\\r\\n'))
+        match = re.match(r"""^  - name:\s*['"]?([A-Za-z0-9_-]+)['"]?\s*(?:#.*)?$""", entry.rstrip())
         if match:
             old_names.append(match.group(1))
     if sorted(old_names) != recorded_services(original_db):
