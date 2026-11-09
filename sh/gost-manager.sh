@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 # Version of this management script (independent from the installed GOST binary version).
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
@@ -350,9 +350,9 @@ validate_config() {
 
 render_config() {
     local rules=$1 output=$2
-    python3 - "$CONFIG_FILE" "$rules" "$output" <<'PY'
+    python3 - "$CONFIG_FILE" "$rules" "$output" "$RULES_FILE" <<'PY'
 import json, pathlib, re, sys
-src, rules_file, dest = map(pathlib.Path, sys.argv[1:])
+src, rules_file, dest, original_db = map(pathlib.Path, sys.argv[1:])
 start = '  # >>> GOST-MANAGER managed services >>>'
 end = '  # <<< GOST-MANAGER managed services <<<'
 lines = src.read_text(encoding='utf-8').splitlines(keepends=True)
@@ -361,6 +361,33 @@ ends = [i for i, x in enumerate(lines) if x.rstrip('\r\n') == end]
 if len(begins) != len(ends) or len(begins) > 1 or (begins and begins[0] >= ends[0]):
     sys.exit('错误：YAML 内的 GOST-MANAGER 标记异常，拒绝自动编辑。')
 if begins:
+    # The managed block must agree with the rule index BEFORE rewriting it.
+    # In particular, a missing/empty/partial index after migrating servers
+    # must never silently erase an existing managed forward.
+    def recorded_services(path):
+        names = []
+        for row in path.read_text(encoding='utf-8').splitlines():
+            if not row or row.startswith('#'):
+                continue
+            parts = row.split('\\t')
+            if len(parts) != 6 or parts[1] not in ('tcp', 'udp', 'both'):
+                sys.exit('错误：管理器规则索引损坏，请先恢复备份。')
+            name, proto = parts[0], parts[1]
+            if not re.fullmatch(r'[a-zA-Z0-9_-]{1,48}', name):
+                sys.exit('错误：规则索引包含非法名称。')
+            for p in ('tcp', 'udp') if proto == 'both' else (proto,):
+                names.append(f'gm-{name}-{p}')
+        return sorted(names)
+
+    old_block = lines[begins[0]+1:ends[0]]
+    old_names = []
+    for entry in old_block:
+        match = re.match(r'^  - name:\s*[\\x22\\x27]?([A-Za-z0-9_-]+)[\\x22\\x27]?\s*(?:#.*)?$', entry.rstrip('\\r\\n'))
+        if match:
+            old_names.append(match.group(1))
+    if sorted(old_names) != recorded_services(original_db):
+        sys.exit('错误：当前 YAML 中的管理器服务与规则索引不一致。'
+                 '请从同一次备份恢复 gost.yml 与 gost-manager.rules；本次不会覆盖旧规则。')
     lines = lines[:begins[0]] + lines[ends[0]+1:]
 records = []
 for row in rules_file.read_text(encoding='utf-8').splitlines():
@@ -431,7 +458,20 @@ dest.write_text(''.join(lines), encoding='utf-8')
 PY
 }
 
+# A running systemd unit must actually read the YAML that we edit.
+# This prevents successful-looking reloads that affect a different GOST instance.
+check_service_config_path() {
+    local execstart
+    if systemctl is-active --quiet gost.service; then
+        execstart=$(systemctl show gost.service -p ExecStart --value 2>/dev/null || true)
+        if [[ $execstart != *"$CONFIG_FILE"* ]]; then
+            die "运行中的 gost.service 未明确使用 $CONFIG_FILE；为避免修改错误实例，已停止操作。请检查 systemctl cat gost。"
+        fi
+    fi
+}
+
 reload_service() {
+    check_service_config_path
     validate_config "$CONFIG_FILE"
     if systemctl is-active --quiet gost; then
         ensure_reload_support
@@ -448,6 +488,7 @@ reload_service() {
 
 apply_staged_rules() {
     local staged_rules=$1 staged_config backup
+    check_service_config_path
     staged_config="$WORK_DIR/gost-staged.yml"
     render_config "$staged_rules" "$staged_config"
     validate_config "$staged_config"
