@@ -1,0 +1,82 @@
+name: GOST manager checks
+
+on:
+  push:
+    paths:
+      - 'sh/gost-manager.sh'
+      - '.github/workflows/gost-manager-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax and CLI version
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n sh/gost-manager.sh
+          bash sh/gost-manager.sh --version | grep -Eq '^gost-manager v[0-9]+\.[0-9]+\.[0-9]+$'
+          bash sh/gost-manager.sh --help | grep -q '用法：'
+          if grep -Eq '洛杉矶|夏威夷|100\.66\.0\.60|100\.66\.0\.62|hawaii-web' sh/gost-manager.sh; then
+            echo 'Unexpected machine-specific text remains' >&2
+            exit 1
+          fi
+      - name: Check embedded Python and rule migration safety
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          import re
+          import subprocess
+          import sys
+
+          script = Path("sh/gost-manager.sh").read_text()
+          blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", script, flags=re.DOTALL)
+          assert len(blocks) >= 2, "Embedded Python blocks not found"
+          for i, block in enumerate(blocks):
+              compile(block, f"embedded-block-{i}", "exec")
+
+          renderer = next(b for b in blocks if "original_db = map(pathlib.Path" in b)
+
+          with TemporaryDirectory() as directory:
+              root = Path(directory)
+              config = root / "gost.yml"
+              current = root / "gost-manager.rules"
+              proposed = root / "proposed.rules"
+              output = root / "candidate.yml"
+
+              config.write_text("services: []\n")
+              current.write_text("")
+              proposed.write_text("test-rule\tboth\t127.0.0.1\t5202\t192.0.2.11\t5201\n")
+              args = [str(config), str(proposed), str(output), str(current)]
+
+              def render():
+                  return subprocess.run([sys.executable, "-c", renderer, *args],
+                                        text=True, capture_output=True)
+
+              result = render()
+              assert result.returncode == 0, result.stderr
+              data = output.read_text()
+              assert "- name: gm-test-rule-tcp" in data
+              assert "- name: gm-test-rule-udp" in data
+
+              config.write_text(data)
+              current.write_text(proposed.read_text())
+              proposed.write_text("test-rule\tboth\t127.0.0.1\t5202\t192.0.2.12\t5201\n")
+              result = render()
+              assert result.returncode == 0, result.stderr
+              assert '192.0.2.12:5201' in output.read_text()
+
+              current.write_text("")
+              result = render()
+              assert result.returncode != 0, "Missing rule index must prevent overwrite"
+              assert "不一致" in result.stderr, result.stderr
+
+          print("Embedded Python and migration safety checks passed")
+          PY
