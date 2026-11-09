@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 # Version of this management script (independent from the installed GOST binary version).
-SCRIPT_VERSION="1.3.4"
+SCRIPT_VERSION="1.4.0"
 
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
@@ -30,9 +30,9 @@ usage() {
     cat <<'HELP'
 GOST v3 安装及 TCP/UDP 转发管理（Debian/Ubuntu + systemd）
 用法：sudo bash gost-manager.sh [--install|--list|--status|--reload|--version|--help]
-不带参数：按规则管理、服务管理、维护诊断分组显示单屏菜单。
+不带参数：显示本机服务状态，按规则管理、服务管理和维护诊断分组。
 
-规则管理：查看、新增、修改、删除 TCP/UDP 转发，支持配置校验与热加载。
+规则管理：查看、新增、修改、删除 TCP/UDP 转发。监听地址从本机网卡动态列出，不预设任何地区、运营商或 VPN 地址段。
 安全设计：下载官方最新稳定版本，校验 SHA256；修改前备份配置；
           通过 SIGHUP 热加载；不覆盖现有 systemd 服务文件或手工规则。
 配置位置：/etc/gost/gost.yml
@@ -131,7 +131,7 @@ except Exception:
 show_brief_status() {
     local bin ver gtext gcolor unit_state service_text service_color
     local enabled active pid auto_text auto_color conf_text conf_color
-    local managed_count total_count
+    local managed_count total_count host_label
     bin=$(find_gost)
     if [[ -n $bin && -x $bin ]]; then
         if ver=$(get_gost_version "$bin"); then
@@ -177,9 +177,11 @@ show_brief_status() {
         managed_count=$(awk -F '\t' 'NF == 6 && $1 !~ /^#/ {n++} END {print n+0}' "$RULES_FILE" 2>/dev/null) || managed_count='?'
     fi
     total_count=$(get_service_count "$bin")
+    host_label=$(hostname -s 2>/dev/null || true)
     # 同宽标签：GOST（4 列）与两字中文标签（4 列）天然对齐，无需计算字符宽度。
     printf '\n  GOST Manager  v%s\n' "$SCRIPT_VERSION"
     printf '  ------------------------------------------\n'
+    [[ -z $host_label ]] || printf '  主机  %s\n' "$host_label"
     printf '  GOST  '; status_value "$gcolor" "$gtext"; printf '\n'
     printf '  服务  '; status_value "$service_color" "$service_text"; printf '\n'
     printf '  自启  '; status_value "$auto_color" "$auto_text"; printf '\n'
@@ -196,6 +198,11 @@ ensure_files() {
         info "已创建空配置文件 $CONFIG_FILE"
     fi
     if [[ ! -e $RULES_FILE ]]; then
+        # Never regenerate an empty rule database over a YAML file that already
+        # contains managed services (e.g. when migrating only gost.yml).
+        if [[ -f $CONFIG_FILE ]] && grep -Fq -- "$MARK_START" "$CONFIG_FILE"; then
+            die "检测到已有管理器生成的规则，但缺少 $RULES_FILE。请从原服务器或备份恢复规则索引，已拒绝操作以免丢失规则。"
+        fi
         : >"$RULES_FILE"
         chmod 600 "$RULES_FILE"
     fi
@@ -526,27 +533,93 @@ for s in services:
 ' "$host" "$port" "$proto" "$exclude_rule"
 }
 
+# List real interface addresses on the host currently running the script.
+# Neither a cloud provider nor a VPN subnet is assumed. Default binding is
+# localhost so pressing Enter never accidentally exposes a service publicly.
+select_listen_address() {
+    local choice interface address index
+    local -a addresses=() interfaces=()
+    if command -v ip >/dev/null 2>&1; then
+        while IFS=$'\t' read -r interface address; do
+            [[ -n ${address:-} ]] || continue
+            interfaces+=("$interface")
+            addresses+=("$address")
+        done < <(
+            {
+                ip -o -4 addr show scope global 2>/dev/null |
+                    awk '{split($4, a, "/"); print $2 "\t" a[1]}'
+                ip -o -6 addr show scope global 2>/dev/null |
+                    awk '{split($4, a, "/"); print $2 "\t[" a[1] "]"}'
+            } | sort -u
+        )
+    fi
+    printf '\n当前服务器的可用监听地址：\n'
+    for ((index = 0; index < ${#addresses[@]}; index++)); do
+        printf '  %2d) %-42s  (%s)\n' "$((index+1))" "${addresses[index]}" "${interfaces[index]}"
+    done
+    printf '   0) 127.0.0.1  (仅当前服务器访问)\n'
+    if (( ${#addresses[@]} == 0 )); then
+        warn '未自动检测到网卡地址，可直接手动输入本机监听 IP。'
+    fi
+    printf '提示：可以选择编号，也可以直接输入任意本机 IP；公网及全接口监听会二次确认。\n'
+    read -r -p '选择编号或输入监听 IP（回车默认 127.0.0.1）：' choice || return 1
+    if [[ -z $choice || $choice == 0 ]]; then
+        LISTEN_ADDRESS=127.0.0.1
+    elif [[ $choice =~ ^[0-9]+$ ]]; then
+        index=$((10#$choice))
+        if ((index < 1 || index > ${#addresses[@]})); then
+            die "监听地址编号无效：$choice"
+        fi
+        LISTEN_ADDRESS="${addresses[index-1]}"
+    else
+        LISTEN_ADDRESS=$choice
+    fi
+    return 0
+}
+
+# Warn before binding to all interfaces or a globally routable address.
+# RFC1918, CGNAT, loopback, and ULA addresses are not treated as globally routable.
+confirm_listener_exposure() {
+    local host=$1 classification
+    classification=$(python3 - "$host" <<'PY'
+import ipaddress, sys
+try:
+    address = ipaddress.ip_address(sys.argv[1].strip('[]'))
+except ValueError:
+    print("hostname")
+else:
+    if address.is_unspecified:
+        print("all")
+    elif address.is_global:
+        print("public")
+    else:
+        print("restricted")
+PY
+) || return 1
+    case $classification in
+        all) ask_yes "监听 $host 将开放所有网卡，可能暴露公网，确认继续？" ;;
+        public) ask_yes "监听 $host 是公网地址，请确认防火墙访问控制，继续？" ;;
+        hostname) warn "监听地址 $host 不是 IP 字面量；请确认该名称解析为本机地址。" ;;
+    esac
+}
+
 add_rule() {
-    local name listen port target target_port proto choice default_ip staged
+    local name listen port target target_port proto choice staged
     require_gost
     ensure_files
-    printf '\n新增本地端口转发（TCP/UDP 由洛杉矶服务器重新向目标建立连接）\n'
-    read -r -p '规则名（英文字母、数字、_、-；例 hawaii-web）：' name
+    printf '\n新增端口转发：当前服务器监听指定端口，并把流量转发到你填写的目标主机。\n'
+    read -r -p '规则名称（字母、数字、_、-；例如 web-forward）：' name
     [[ $name =~ ^[a-zA-Z0-9_-]{1,48}$ ]] || die '规则名不合法。'
     if grep -Eq "^${name}"$'\t' "$RULES_FILE"; then
         die "规则 $name 已经存在，请换一个名称。"
     fi
-    default_ip=$(ip -o -4 address show 2>/dev/null | awk '{split($4,a,"/"); if (a[1] ~ /^100\.66\./) {print a[1];exit}}' || true)
-    default_ip=${default_ip:-127.0.0.1}
-    read -r -p "监听 IP（默认 $default_ip；可填 100.66.0.60，不建议公网 0.0.0.0）：" listen
-    listen=${listen:-$default_ip}
-    valid_host "$listen" || die '监听 IP/地址格式不合法。'
-    if [[ $listen == 0.0.0.0 || $listen == '::' || $listen == '[::]' ]]; then
-        ask_yes '将监听所有网络接口，可能暴露公网端口，确定吗？' || { info '已取消。'; return; }
-    fi
+    select_listen_address || return 0
+    listen=$LISTEN_ADDRESS
+    valid_host "$listen" || die '监听 IP 格式不合法；IPv6 请使用 [地址] 格式。'
+    confirm_listener_exposure "$listen" || { info '已取消。'; return; }
     read -r -p '监听端口（1-65535）：' port
     valid_port "$port" || die '监听端口无效。'
-    read -r -p '目标 IP 或域名（例 100.66.0.62）：' target
+    read -r -p '转发目标 IP 或域名（IPv6 请用 [地址] 格式）：' target
     valid_host "$target" || die '目标地址格式不合法。'
     read -r -p "目标端口（默认 $port）：" target_port
     target_port=${target_port:-$port}
@@ -654,18 +727,23 @@ edit_rule() {
         die "规则名 $name 已存在。"
     fi
 
+    printf '可用网卡监听地址（修改时可手动输入）：\n'
+    if command -v ip >/dev/null 2>&1; then
+        ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print "  " $2 "  " a[1]}' || true
+        ip -o -6 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print "  " $2 "  [" a[1] "]"}' || true
+    fi
     read -r -p "监听 IP [$old_listen]：" input || return 0
     listen=${input:-$old_listen}
-    valid_host "$listen" || die '监听地址格式不合法。'
-    if [[ $listen == 0.0.0.0 || $listen == :: || $listen == '[::]' ]]; then
-        ask_yes '监听所有网卡可能暴露公网端口，确定吗？' || { info '已取消。'; return; }
+    valid_host "$listen" || die '监听地址格式不合法；IPv6 请使用 [地址] 格式。'
+    if [[ $listen != "$old_listen" ]]; then
+        confirm_listener_exposure "$listen" || { info '已取消。'; return; }
     fi
 
     read -r -p "监听端口 [$old_port]：" input || return 0
     port=${input:-$old_port}
     valid_port "$port" || die '监听端口无效。'
 
-    read -r -p "目标 IP 或域名 [$old_target]：" input || return 0
+    read -r -p "转发目标 IP 或域名 [$old_target]：" input || return 0
     target=${input:-$old_target}
     valid_host "$target" || die '目标地址格式不合法。'
 
