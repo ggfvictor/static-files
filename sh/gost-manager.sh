@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 # Version of this management script (independent from the installed GOST binary version).
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
@@ -255,7 +255,9 @@ install_binary() {
     [[ $expected =~ ^[[:xdigit:]]{64}$ ]] || die "找不到 $asset 的 SHA256，拒绝安装。"
     actual=$(sha256sum "$WORK_DIR/$asset" | awk '{print $1}')
     [[ ${expected,,} == "${actual,,}" ]] || die 'SHA256 校验失败，已拒绝安装。'
-    tar -tzf "$WORK_DIR/$asset" | grep -Eq '^\./?gost$|^gost$' || die '压缩包内没有 gost 程序。'
+    # Avoid tar|grep -q with pipefail: grep may exit early and make tar fail with SIGPIPE.
+    tar -tzf "$WORK_DIR/$asset" >"$WORK_DIR/archive-contents.txt" || die '安装包损坏或不是有效 gzip 压缩包。'
+    grep -Eq '^\./?gost$|^gost$' "$WORK_DIR/archive-contents.txt" || die '压缩包内没有 gost 程序。'
     mkdir -p "$WORK_DIR/extracted"
     tar -xzf "$WORK_DIR/$asset" -C "$WORK_DIR/extracted" --no-same-owner
     if [[ -f $WORK_DIR/extracted/gost ]]; then
