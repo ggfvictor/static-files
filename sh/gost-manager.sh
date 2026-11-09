@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 # Version of this management script (independent from the installed GOST binary version).
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 
 CONFIG_DIR=/etc/gost
 CONFIG_FILE=$CONFIG_DIR/gost.yml
@@ -32,7 +32,8 @@ GOST v3 安装及 TCP/UDP 转发管理（Debian/Ubuntu + systemd）
 用法：sudo bash gost-manager.sh [--install|--list|--status|--reload|--version|--help]
 不带参数：显示本机服务状态，按规则管理、服务管理和维护诊断分组。
 
-规则管理：查看、新增、修改、删除 TCP/UDP 转发。监听地址从本机网卡动态列出，不预设任何地区、运营商或 VPN 地址段。
+规则管理：查看、新增、修改、删除 TCP/UDP 转发；动态读取本机监听地址、校验本机 IP 和端口冲突。
+通用部署：不预设服务器地区、运营商或 VPN 网段；所有目标由用户自行填写。
 安全设计：下载官方最新稳定版本，校验 SHA256；修改前备份配置；
           通过 SIGHUP 热加载；不覆盖现有 systemd 服务文件或手工规则。
 配置位置：/etc/gost/gost.yml
@@ -618,6 +619,71 @@ select_listen_address() {
     return 0
 }
 
+# Validate manually chosen literal bind addresses against the current host.
+# This prevents copying a private IP from a different machine and getting a bind failure.
+# Wildcard/loopback addresses are allowed; non-IP hostnames retain GOST's own resolution rules.
+validate_local_listener() {
+    local host=$1 result=0
+    if ! command -v ip >/dev/null 2>&1; then
+        warn '系统没有 ip 命令，无法核对监听地址是否属于本机。'
+        return 0
+    fi
+    python3 - "$host" <<'PY' || result=$?
+import ipaddress, re, subprocess, sys
+host = sys.argv[1].strip("[]")
+try:
+    selected = ipaddress.ip_address(host)
+except ValueError:
+    # A hostname may resolve locally and is checked by GOST when binding.
+    sys.exit(0)
+if selected.is_unspecified or selected.is_loopback:
+    sys.exit(0)
+try:
+    result = subprocess.run(["ip", "-o", "addr", "show"], text=True,
+                            capture_output=True, check=True)
+except (OSError, subprocess.CalledProcessError):
+    sys.exit(3)
+for match in re.finditer(r"\binet6?\s+([0-9a-fA-F:.]+)/[0-9]+", result.stdout):
+    try:
+        if ipaddress.ip_address(match.group(1)) == selected:
+            sys.exit(0)
+    except ValueError:
+        pass
+sys.exit(2)
+PY
+    case $result in
+        0) return 0 ;;
+        2) die "监听地址 $host 不属于当前服务器。请从本机地址列表选择，或使用 127.0.0.1 / 0.0.0.0。";;
+        3) warn '无法获取本机 IP 地址，跳过监听地址归属检查。' ;;
+        *) die "监听地址检查发生异常（退出码 $result）。" ;;
+    esac
+}
+
+# Manual edits must not silently mutate the section controlled by the rule index.
+# That section can only be changed through add/edit/remove manager operations.
+managed_block_unchanged() {
+    local before=$1 after=$2
+    python3 - "$before" "$after" <<'PY'
+from pathlib import Path
+import sys
+start = "  # >>> GOST-MANAGER managed services >>>"
+end = "  # <<< GOST-MANAGER managed services <<<"
+def block(path):
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    a = [i for i, line in enumerate(lines) if line == start]
+    b = [i for i, line in enumerate(lines) if line == end]
+    if not a and not b:
+        return None
+    if len(a) != 1 or len(b) != 1 or a[0] >= b[0]:
+        raise ValueError("invalid managed section boundaries")
+    return lines[a[0]:b[0]+1]
+try:
+    sys.exit(0 if block(sys.argv[1]) == block(sys.argv[2]) else 1)
+except (ValueError, UnicodeError, OSError):
+    sys.exit(1)
+PY
+}
+
 # Warn before binding to all interfaces or a globally routable address.
 # RFC1918, CGNAT, loopback, and ULA addresses are not treated as globally routable.
 confirm_listener_exposure() {
@@ -657,6 +723,7 @@ add_rule() {
     select_listen_address || return 0
     listen=$LISTEN_ADDRESS
     valid_host "$listen" || die '监听 IP 格式不合法；IPv6 请使用 [地址] 格式。'
+    validate_local_listener "$listen"
     confirm_listener_exposure "$listen" || { info '已取消。'; return; }
     read -r -p '监听端口（1-65535）：' port
     valid_port "$port" || die '监听端口无效。'
@@ -713,6 +780,10 @@ edit_manual_yaml() {
     if cmp -s "$backup/gost.yml" "$CONFIG_FILE"; then
         info '配置没有变化，无需热加载。'
         return 0
+    fi
+    if ! managed_block_unchanged "$backup/gost.yml" "$CONFIG_FILE"; then
+        cp -p "$backup/gost.yml" "$CONFIG_FILE"
+        die '管理器自动生成的规则区发生变化，已恢复原文件。请通过规则管理菜单修改该区域。'
     fi
     bin=$(find_gost)
     if ! "$bin" -C "$CONFIG_FILE" -O yaml >"$WORK_DIR/manual-check.out" 2>"$WORK_DIR/manual-check.err"; then
@@ -777,6 +848,7 @@ edit_rule() {
     listen=${input:-$old_listen}
     valid_host "$listen" || die '监听地址格式不合法；IPv6 请使用 [地址] 格式。'
     if [[ $listen != "$old_listen" ]]; then
+        validate_local_listener "$listen"
         confirm_listener_exposure "$listen" || { info '已取消。'; return; }
     fi
 
