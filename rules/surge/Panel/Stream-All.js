@@ -187,14 +187,14 @@ async function checkDisney() {
     if (geo.supported) return 'Disney+: 已解锁 ➟ ' + geo.region
     // 不支持地区但网页能访问：区分未上线与真正被拒绝的区域。
     if (home.status === 200 &&
-        !/Sorry, Disney\\+ is not available in your region[.]|error.code.73|forbidden.location/i.test(home.body)) {
+        !/Sorry, Disney\+ is not available in your region[.]|error.code.73|forbidden.location/i.test(home.body)) {
       return 'Disney+: 即将登陆 ➟ ' + geo.region
     }
     return 'Disney+: 未支持 🚫 ➟ ' + geo.region
   }
 
   if (home.status === 403 || home.status === 404 ||
-      /Sorry, Disney\\+ is not available in your region[.]|error.code.73|forbidden.location/i.test(home.body || '')) {
+      /Sorry, Disney\+ is not available in your region[.]|error.code.73|forbidden.location/i.test(home.body || '')) {
     return 'Disney+: 未支持 🚫'
   }
   if (geo.error === 'timeout') return 'Disney+: 检测超时 🚦'
