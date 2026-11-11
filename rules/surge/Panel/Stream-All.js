@@ -2,7 +2,7 @@
  * Stream-All 流媒体解锁检测 - 并发增强版
  * 基于 Rabbit-Spec / Surge 的 Stream-All 面板检测逻辑改进
  * 原始项目：https://github.com/Rabbit-Spec/Surge
- * 修改日期：2026-11-11（修复 Disney+ 网页检测误报）
+ * 修改日期：2026-11-11（修正 Netflix HTTP 200 全解锁误判）
  * Netflix 非自制内容：LEGO Ninjago (81280792)、Breaking Bad (70143836)
  * Netflix 自制测试：Test Patterns (80018499)
  * YouTube / Netflix / Disney+ 与三个 Netflix 探针均并发检测
@@ -54,32 +54,52 @@ function getRegion(headers) {
   return (match[1] || 'US').toUpperCase()
 }
 
+// Netflix 当前会在“不可观看”的详情页上返回 HTTP 200。
+// 因此检测仅依据网页可访问性及明确的地区限制提示；不能证明真正可以播放。
+function netflixPageBlocked(body) {
+  if (!body) return false
+  const html = String(body).replace(/\\u2019|\\u0027|&#8217;|&#x2019;|&rsquo;/gi, "'")
+  return /this title.{0,120}(?:isn.t|is not|not).{0,90}available to watch in your country|this title.{0,90}not available in your current region|(?:oh no.{0,80})?this title.{0,80}unavailable to watch|(?:目前|当前).{0,24}(?:无法|無法|不可).{0,24}(?:播放|觀看|观看)|(?:无法|無法).{0,24}(?:在您所在|在你所在).{0,24}(?:观看|觀看)/i.test(html)
+}
+
 async function checkNetflix() {
+  // 三个探针仍然并发进行。200 仅表示详情页有响应，不是可播放证明。
   const ids = [81280792, 70143836, 80018499]
   const results = await Promise.all(ids.map((id) => request('https://www.netflix.com/title/' + id)))
   const probes = results.map((res) => {
-    if (res.status === 200) return { state: 'available', region: getRegion(res.headers) }
-    if (res.status === 403 || res.status === 404) return { state: 'unavailable' }
-    return { state: 'error' }
+    const http = res.status || 0
+    const region = getRegion(res.headers || {})
+    if (http === 200 && netflixPageBlocked(res.body)) {
+      return { state: 'blocked', region, http }
+    }
+    if (http === 200) return { state: 'page', region, http }
+    if (http === 403 || http === 404) return { state: 'unavailable', region, http }
+    return { state: 'error', region, http, error: res.error || '' }
   })
+
+  // 日志注明每部影片的独立结果，便于核查是哪部片导致页面通过。
+  console.log('Netflix: Ninjago=' + probes[0].state + '/' + probes[0].http +
+    ', BreakingBad=' + probes[1].state + '/' + probes[1].http +
+    ', TestPatterns=' + probes[2].state + '/' + probes[2].http)
+
   const nonOriginal = probes.slice(0, 2)
   const original = probes[2]
-  const full = nonOriginal.find((item) => item.state === 'available')
-  const region = (full && full.region) || original.region || ''
-  const regionLabel = region ? ' ➟ ' + region : '（地区未知）'
+  const count = nonOriginal.filter((p) => p.state === 'page').length
+  const regionItem = nonOriginal.find((p) => p.region) || (original.region ? original : null)
+  const regionSuffix = regionItem ? ' ➟ ' + regionItem.region : ''
+  const errorCount = nonOriginal.filter((p) => p.state === 'error').length
 
-  console.log('Netflix probes: Ninjago=' + probes[0].state +
-    ', BreakingBad=' + probes[1].state + ', TestPatterns=' + probes[2].state)
-
-  if (full) return 'Netflix: 已完整解锁' + regionLabel
-  if (original.state === 'available') {
-    if (nonOriginal.every((item) => item.state === 'unavailable')) {
-      return 'Netflix: 仅解锁自制剧' + regionLabel
-    }
-    return 'Netflix: 自制剧可用，非自制剧检测异常' + regionLabel
+  // 无账号 Cookie 或播放会话的 Surge 脚本无法确认真正播放成功；
+  // 即便两个页面均返回 200，也不再使用“完整解锁”的表述。
+  if (count > 0) {
+    return 'Netflix: 非自制剧网页可访问 ' + count + '/2' + regionSuffix + '（未验播放）'
   }
-  if (original.state === 'unavailable' && nonOriginal.every((item) => item.state === 'unavailable')) {
-    return 'Netflix: 该节点不支持解锁'
+  if (original.state === 'page') {
+    if (errorCount > 0) return 'Netflix: 自制剧页面可访问，其他检测异常' + regionSuffix
+    return 'Netflix: 仅自制剧迹象' + regionSuffix + '（网页检测）'
+  }
+  if (original.state !== 'error' && errorCount === 0) {
+    return 'Netflix: 未检测到可用内容页面'
   }
   return 'Netflix: 检测失败，请刷新面板'
 }
