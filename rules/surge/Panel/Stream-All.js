@@ -2,7 +2,7 @@
  * Stream-All 流媒体解锁检测 - 并发增强版
  * 基于 Rabbit-Spec / Surge 的 Stream-All 面板检测逻辑改进
  * 原始项目：https://github.com/Rabbit-Spec/Surge
- * 修改日期：2026-11-11（修复 Netflix 仅自制剧误报）
+ * 修改日期：2026-11-11（恢复原版 Netflix HTTP 判断，保留并发与五个探针）
  * Netflix 非自制：Ninjago (81280792)、Breaking Bad (70143836)、Suits (70195800)、Brooklyn 99 (70281562)
  * Netflix 自制测试：Test Patterns (80018499)
  * YouTube / Netflix / Disney+ 与五个 Netflix 探针均并发检测
@@ -56,15 +56,10 @@ function getRegion(headers) {
 
 // Netflix 当前会在“不可观看”的详情页上返回 HTTP 200。
 // 因此检测仅依据网页可访问性及明确的地区限制提示；不能证明真正可以播放。
-function netflixPageBlocked(body) {
-  if (!body) return false
-  const html = String(body).replace(/\\u2019|\\u0027|&#8217;|&#x2019;|&rsquo;/gi, "'")
-  return /this title.{0,120}(?:isn.t|is not|not).{0,90}available to watch in your country|this title.{0,90}not available in your current region|(?:oh no.{0,80})?this title.{0,80}unavailable to watch|(?:目前|当前).{0,24}(?:无法|無法|不可).{0,24}(?:播放|觀看|观看)|(?:无法|無法).{0,24}(?:在您所在|在你所在).{0,24}(?:观看|觀看)/i.test(html)
-}
-
+// 按原版 HTTP 状态码判定：200=可访问，404/403=不可访问；无登录态。
+// 这是一项网页探测，不等于实际视频播放解锁验证。
 async function checkNetflix() {
-  // 四个非自制剧交叉检测 + Test Patterns；所有请求同时启动。
-  // 单个片名可能因地区版权不可用，不可将其视为“仅自制剧”证据。
+  // 四部非自制剧 + 一个自制测试页面，保留现有地址并发执行。
   const titles = [
     { id: 81280792, name: 'Ninjago' },
     { id: 70143836, name: 'BreakingBad' },
@@ -72,40 +67,40 @@ async function checkNetflix() {
     { id: 70281562, name: 'Brooklyn99' },
     { id: 80018499, name: 'TestPatterns' },
   ]
-  const responses = await Promise.all(titles.map((item) =>
-    request('https://www.netflix.com/title/' + item.id)))
-  const probes = responses.map((res, i) => {
-    const http = res.status || 0
-    const region = getRegion(res.headers || {})
-    const state = http === 200
-      ? (netflixPageBlocked(res.body) ? 'geo-blocked' : 'page-200')
-      : (http === 403 || http === 404 ? 'http-denied' : 'error')
-    return { name: titles[i].name, id: titles[i].id, region, http, state }
-  })
-  console.log('Netflix probes (not playback): ' +
-    probes.map((p) => p.name + '=' + p.state + '/' + p.http +
+  const responses = await Promise.all(titles.map((title) =>
+    request('https://www.netflix.com/title/' + title.id)))
+  const probes = responses.map((res, i) => ({
+    name: titles[i].name,
+    status: res.status || 0,
+    region: getRegion(res.headers || {}),
+    error: res.error || '',
+  }))
+
+  console.log('Netflix probes (HTTP): ' +
+    probes.map((p) => p.name + '=' + (p.status || p.error || 'unknown') +
       (p.region ? '/' + p.region : '')).join(', '))
 
   const nonOriginal = probes.slice(0, 4)
   const original = probes[4]
-  const pages = nonOriginal.filter((p) => p.state === 'page-200').length
-  const region = (probes.find((p) => p.region) || {}).region || ''
-  const label = region ? ' ➟ ' + region : ''
+  const full = nonOriginal.find((p) => p.status === 200)
+  const regionOf = (probe) => probe.region ? ' ➟ ' + probe.region : '（地区未知）'
 
-  // 未登录的页面探测不等于已登录账号真正可以播放，不再断言“完整解锁”。
-  if (pages > 0) {
-    return 'Netflix: 非自制网页可访问 ' + pages + '/4' + label + '（未验播放）'
+  // 与原版相同：只要任意非自制内容返回 HTTP 200，判为完整解锁。
+  if (full) return 'Netflix: 已完整解锁' + regionOf(full)
+
+  // 不要把超时和未知状态码误认为“仅自制剧”。
+  if (nonOriginal.some((p) => p.status !== 403 && p.status !== 404)) {
+    return 'Netflix: 检测失败，请刷新面板'
   }
 
-  // 页面返回 403/404 或特定片名被限制，不能推出整个非自制片库都不可用。
-  // 仅自制剧分类需要实际播放或明确的代理限制证据才能确认。
-  if (original.state === 'page-200') {
-    return 'Netflix: 自制剧网页通过，非自制待确认' + label
+  // 非自制内容均为 403/404 时，再使用并发取得的自制内容结果。
+  if (original.status === 200) {
+    return 'Netflix: 仅解锁自制剧' + regionOf(original)
   }
-  if (probes.every((p) => p.state === 'geo-blocked' || p.state === 'http-denied')) {
-    return 'Netflix: 页面检测未通过' + label + '（需实测）'
+  if (original.status === 403 || original.status === 404) {
+    return 'Netflix: 该节点不支持解锁'
   }
-  return 'Netflix: 检测不确定，请查看日志' + label
+  return 'Netflix: 检测失败，请刷新面板'
 }
 
 async function checkYouTube() {
