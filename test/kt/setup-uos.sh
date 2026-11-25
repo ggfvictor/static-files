@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scan Setup v0.1 | UOS Desktop (Debian-compatible Samba/systemd edition)
+# Scan Setup v0.2 | UOS Desktop (Debian-compatible Samba/systemd edition)
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -7,7 +7,26 @@ ACCOUNT=scan
 SHARE=scan
 CONF=/etc/samba/smb.conf
 TAG='ScanSetup v0.1'
-die() { printf '\n错误：%s\n' "$*" >&2; exit 1; }
+# ANSI decoration is for interactive display only. Never decorate machine-readable
+# results, passwords passed to system commands, or text sent to the clipboard.
+ui() {
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ "${NO_COLOR+x}" != x ]; then
+        printf '\033[%sm' "$1"
+        shift
+        printf "$@"
+        printf '\033[0m'
+    else
+        shift
+        printf "$@"
+    fi
+}
+show_report() {
+    ui '1;35' '\n========== 复制开始 | 请发送给 IT ==========\n'
+    ui '1;35' '%s\n' "$1"
+    ui '1;35' '========== 复制结束 | 仅复制两线之间 ==========\n\n'
+}
+ask() { ui '1;33' '%s' "$1" >&2; read -r "$2"; }
+die() { ui '1;31' '\n[错误] %s\n' "$*" >&2; exit 1; }
 valid_ip() { local a b c d extra x; IFS=. read -r a b c d extra <<< "$1"; [[ -z ${extra:-} && $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1; for x in "$a" "$b" "$c" "$d"; do ((10#$x <= 255)) || return 1; done; }
 # Convert an IPv4/prefix to canonical network/netmask, accepted by Samba and UFW.
 network_of() {
@@ -93,50 +112,52 @@ CFG
         if ((rc!=0)); then
             set +e
             if ((changed)); then cp -p -- "$backup" "$CONF"; systemctl reload smbd >/dev/null 2>&1 || smbcontrol smbd reload-config >/dev/null 2>&1; fi
-            if ((added_smb)); then smbpasswd -x "$ACCOUNT" >/dev/null 2>&1 || printf 'Samba 用户清理失败，请 IT 处理。\n' >&2; fi
-            if ((madeuser)); then userdel "$ACCOUNT" >/dev/null 2>&1 || printf '系统用户清理失败，请 IT 处理。\n' >&2; fi
-            printf '配置失败。原配置备份：%s；已安装的软件/启动的服务可能保留。\n' "$backup" >&2
+            if ((added_smb)); then smbpasswd -x "$ACCOUNT" >/dev/null 2>&1 || ui '1;31' '[错误] Samba 用户清理失败，请 IT 处理。\n' >&2; fi
+            if ((madeuser)); then userdel "$ACCOUNT" >/dev/null 2>&1 || ui '1;31' '[错误] 系统用户清理失败，请 IT 处理。\n' >&2; fi
+            ui '1;31' '[错误] 配置失败。原配置备份：%s；已安装的软件/启动的服务可能保留。\n' "$backup" >&2
         fi
         exit "$rc"
     }
     trap rollback EXIT
     useradd --system --no-create-home --home-dir /nonexistent --shell "$nologin" --comment "$TAG" "$ACCOUNT"
     madeuser=1
+    ui '1;32' '[完成] 专用扫描账号已创建。\n' >&2
     printf '%s\n%s\n' "$password" "$password" | smbpasswd -s -a "$ACCOUNT" >/dev/null
     added_smb=1
     mv -f -- "$temp" "$CONF"; changed=1
     systemctl enable --now smbd >/dev/null
     systemctl reload smbd >/dev/null 2>&1 || smbcontrol smbd reload-config >/dev/null
     systemctl is-active --quiet smbd || die 'smbd 未启动。'
+    ui '1;32' '[完成] SMB 共享配置已加载。\n' >&2
     # Local authentication plus write/delete test. The secret is in a root-only temp file, not command arguments.
     authdir=$(mktemp -d)
     printf 'username = %s\npassword = %s\n' "$ACCOUNT" "$password" > "$authdir/auth"
     printf 'ScanSetup local test\n' > "$authdir/test"
     local probe="scan_setup_test_$(openssl rand -hex 6).tmp"
     if smbclient //127.0.0.1/scan -p 445 -A "$authdir/auth" --option='client min protocol=SMB2' -c "put $authdir/test $probe" >/dev/null 2>&1 && smbclient //127.0.0.1/scan -p 445 -A "$authdir/auth" --option='client min protocol=SMB2' -c "del $probe" >/dev/null 2>&1; then
-        printf '本机 SMB2/3 认证、写入和删除测试通过。\n' >&2
+        ui '1;32' '[完成] 本机 SMB2/3 认证、写入和删除测试通过。\n' >&2
         printf 'LOCAL_TEST=PASS\n'
     else
-        printf '警告：本机 SMB2/3 测试失败；共享已配置，需 IT 检查接口、策略、权限。\n' >&2
+        ui '1;33' '[注意] 本机 SMB2/3 测试失败；共享已配置，需 IT 检查接口、策略、权限。\n' >&2
         printf 'LOCAL_TEST=FAIL\n'
     fi
     # Restrict any NEW UFW allowance to the selected sources. Never disable a firewall.
     if command -v ufw >/dev/null && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
         for source in $sources; do
-            if ! ufw allow proto tcp from "$source" to any port 445 >/dev/null 2>&1; then printf '警告：UFW 规则添加失败，请 IT 处理。\n' >&2; printf 'FIREWALL=CHECK\n'; break; fi
+            if ! ufw allow proto tcp from "$source" to any port 445 >/dev/null 2>&1; then ui '1;33' '[注意] UFW 规则添加失败，请 IT 处理。\n' >&2; printf 'FIREWALL=CHECK\n'; break; fi
         done
     else
-        printf '未检测到启用的 UFW；如有其他防火墙/终端安全软件，请 IT 核查 TCP 445。\n' >&2
+        ui '1;33' '[注意] 未检测到启用的 UFW；如有其他防火墙/终端安全软件，请 IT 核查 TCP 445。\n' >&2
     fi
     prefix=$(testparm -s --parameter-name='server min protocol' "$CONF" 2>/dev/null || true)
-    case "$prefix" in NT1|LANMAN*|CORE*) printf '警告：现有 Samba 全局协议允许 SMB1，工具未修改该策略。\n' >&2;; esac
-    printf '原 Samba 配置备份：%s\n' "$backup" >&2
+    case "$prefix" in NT1|LANMAN*|CORE*) ui '1;33' '[注意] 现有 Samba 全局协议允许 SMB1，工具未修改该策略。\n' >&2;; esac
+    ui '1;36' '原 Samba 配置备份：%s\n' "$backup" >&2
     exit 0
 }
 if [[ ${1:-} == --configure-root ]]; then shift; configure_root "$@"; exit 0; fi
 [[ $EUID != 0 ]] || die '请在员工自己的桌面终端运行，不要 sudo 整个脚本。'
 for cmd in sudo ip openssl getent stat find awk; do command -v "$cmd" >/dev/null || die "缺少 $cmd，请联系 IT。"; done
-printf '\n=== Scan Setup v0.1 / UOS ===\n'
+ui '1;36' '\n========== Scan Setup v0.2 / UOS ==========\n'
 owner=$(id -un)
 desktop=''
 if command -v xdg-user-dir >/dev/null; then desktop=$(xdg-user-dir DESKTOP 2>/dev/null || true); fi
@@ -149,42 +170,43 @@ folder="$desktop/scan"
 if [[ -e $folder ]]; then [[ -d $folder && -z $(find "$folder" -mindepth 1 -maxdepth 1 -print -quit) ]] || die 'scan 不是空文件夹，请 IT 检查。'; fi
 mapfile -t choices < <(ip -o -4 addr show up scope global | awk '{print $2 " " $4}' | awk '$2 !~ /^169\.254\./')
 ((${#choices[@]})) || die '没有有效 IPv4，请先连接办公网络。'
-printf '请选择办公网 IPv4（不要选择 VPN 或虚拟网卡）：\n'
+ui '1;36' '请选择办公网 IPv4（不要选择 VPN 或虚拟网卡）：\n'
 for i in "${!choices[@]}"; do printf '  %d. %s\n' "$((i+1))" "${choices[i]}"; done
 while :; do
-    read -r -p '输入序号（仅一项可回车）：' n
+    ask '输入序号（仅一项可回车）：' n
     [[ -n $n || ${#choices[@]} != 1 ]] || n=1
     if [[ $n =~ ^[0-9]{1,4}$ ]] && ((10#$n>=1 && 10#$n<=${#choices[@]})); then break; fi
 done
 cidr=${choices[10#$n-1]##* }; ip=${cidr%/*}; net=$(network_of "$cidr") || die '无法识别办公网网段。'
-read -r -p "打印机 IPv4（多个英文逗号分隔；回车=仅所选网段 $net）：" raw
+ask "打印机 IPv4（多个英文逗号分隔；回车=仅所选网段 $net）：" raw
 sources=$net
 if [[ -n $raw ]]; then
     sources=''; IFS=, read -r -a printers <<< "$raw"
     for addr in "${printers[@]}"; do addr=${addr//[[:space:]]/}; valid_ip "$addr" || die "无效的打印机 IP：$addr"; sources+=" $addr"; done
     sources=${sources# }
 fi
-read -r -p "打印机通讯录显示名（员工姓名，回车=$owner）：" employee
+ask "打印机通讯录显示名（员工姓名，回车=$owner）：" employee
 employee=${employee:-$owner}
-printf '将创建 %s、专用 SMB 账号 scan，并限制来源为 %s。\n' "$folder" "$sources"
-read -r -p '确认配置？输入 Y 继续：' answer; [[ $answer == [Yy] ]] || die '用户取消。'
+ui '1;36' '将创建 %s、专用 SMB 账号 scan，并限制来源为 %s。\n' "$folder" "$sources"
+ask '确认配置？输入 Y 继续：' answer; [[ $answer == [Yy] ]] || die '用户取消。'
 sudo -v || die '需要 sudo 权限；请由 IT 授权或在员工会话协助执行。'
 packages=()
 if ! command -v smbd >/dev/null || ! command -v testparm >/dev/null || ! command -v smbpasswd >/dev/null; then packages+=(samba); fi
 if ! command -v smbclient >/dev/null; then packages+=(smbclient); fi
 if [[ -n ${DISPLAY:-} ]] && ! command -v xclip >/dev/null && ! command -v xsel >/dev/null && ! command -v wl-copy >/dev/null; then
-    read -r -p '安装 xclip 以支持自动复制？(Y/n)：' clip_answer; [[ $clip_answer == [Nn] ]] || packages+=(xclip)
+    ask '安装 xclip 以支持自动复制？(Y/n)：' clip_answer; [[ $clip_answer == [Nn] ]] || packages+=(xclip)
 fi
 if [[ -n ${WAYLAND_DISPLAY:-} && -z ${DISPLAY:-} ]] && ! command -v wl-copy >/dev/null; then
-    read -r -p '安装 wl-clipboard 以支持自动复制？(Y/n)：' clip_answer; [[ $clip_answer == [Nn] ]] || packages+=(wl-clipboard)
+    ask '安装 wl-clipboard 以支持自动复制？(Y/n)：' clip_answer; [[ $clip_answer == [Nn] ]] || packages+=(wl-clipboard)
 fi
 if ((${#packages[@]})); then
-    printf '需要安装：%s。安装 Samba 可能启用其默认服务，请遵循企业软件策略。\n' "${packages[*]}"
-    read -r -p '允许通过已配置的 APT 源安装？(Y/n)：' install_answer
+    ui '1;33' '[注意] 需要安装：%s。安装 Samba 可能启用其默认服务，请遵循企业软件策略。\n' "${packages[*]}"
+    ask '允许通过已配置的 APT 源安装？(Y/n)：' install_answer
     [[ $install_answer != [Nn] ]] || die '依赖安装取消。'
     sudo apt-get install -y "${packages[@]}" || die '软件安装失败，请检查 UOS 软件源/权限。'
 fi
 mkdir -p -- "$folder"
+ui '1;32' '[完成] 桌面 scan 文件夹已准备。\n'
 password="Sc9!$(openssl rand -hex 8)"
 [[ $password =~ ^Sc9![a-f0-9]{16}$ ]] || die '随机密码生成失败。'
 script=$(readlink -f -- "$0")
@@ -195,5 +217,10 @@ status='共享已配置；等待打印机实测'
 if grep -q 'LOCAL_TEST=PASS' <<< "$result"; then status='本机 SMB2/3 认证和读写测试通过；等待打印机实测'; else status='共享已配置，本机 SMB 测试失败；请 IT 检查'; fi
 if grep -q 'FIREWALL=CHECK' <<< "$result"; then status+='；防火墙待检查'; fi
 report=$(printf '【扫描到个人电脑 - 配置信息】\n员工姓名：%s\n操作系统：UOS\n计算机名：%s\n服务器 IP：%s\n端口：445 (TCP)\n共享名称：scan\n子目录：无（共享根目录）\nUNC 路径：\\\\%s\\scan\nSMB 用户名：scan\nSMB 密码：%s\n状态：%s' "$employee" "$(hostname)" "$ip" "$ip" "$password" "$status")
-printf '\n%s\n\n' "$report"
-if copy_report "$report"; then printf '已复制配置信息。请通过单位批准的安全渠道发送给 IT，发送后清除剪贴板。\n'; else printf '自动复制不可用，请手动复制上述信息。\n'; fi
+show_report "$report"
+if copy_report "$report"; then
+    ui '1;32' '[完成] 已自动复制到剪贴板，无需手动复制。\n'
+else
+    ui '1;33' '[注意] 自动复制不可用，请手动复制上方两条分隔线之间的完整内容。\n'
+fi
+ui '1;36' '[操作] 请通过单位批准的安全渠道发送给 IT，发送后清除剪贴板。\n'
