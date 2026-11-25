@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Scan Setup v0.2 | UOS Desktop (Debian-compatible Samba/systemd edition)
+# Scan Setup v0.3-uos | UOS Desktop (Debian-compatible Samba/systemd edition)
 set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ACCOUNT=scan
+ACCOUNT=scanuser
 SHARE=scan
 CONF=/etc/samba/smb.conf
 TAG='ScanSetup v0.1'
@@ -48,7 +48,7 @@ configure_root() {
     local owner=$1 folder=$2 ip=$3 sources=$4 password role backup temp effective uspath prefix existing
     IFS= read -r password || die '未读取到专用密码。'
     [[ $password =~ ^Sc9![a-f0-9]{16}$ ]] || die '密码格式错误。'
-    [[ $owner =~ ^[a-zA-Z0-9_.-]+\$?$ && $owner != root && $owner != scan ]] || die '当前用户名称不受支持。'
+    [[ $owner =~ ^[a-zA-Z0-9_.-]+\$?$ && $owner != root && $owner != "$ACCOUNT" && $owner != "$SHARE" ]] || die '当前用户名称不受支持。'
     [[ -d $folder && ! -L $folder && $folder == /*/scan && $folder != *$'\n'* && $folder != *$'\r'* && $folder != *%* && $folder != *'"'* && $folder != *'\'* ]] || die '共享路径不安全或不受支持。'
     [[ $(stat -c %U -- "$folder") == "$owner" ]] || die 'scan 目录不属于当前员工。'
     [[ -z $(find "$folder" -mindepth 1 -maxdepth 1 -print -quit) ]] || die 'scan 中有旧资料，停止共享。'
@@ -71,9 +71,13 @@ configure_root() {
     if grep -Eiq '^\[scan\][[:space:]]*$' <<< "$effective"; then die '已有 scan 共享，本版不会覆盖。'; fi
     uspath=$(testparm -s --parameter-name='usershare path' "$CONF" 2>/dev/null || true)
     if [[ -n $uspath && -e $uspath/scan ]]; then die '已有文件管理器创建的 scan 共享，请联系 IT。'; fi
-    if getent passwd "$ACCOUNT" >/dev/null; then die '已有 scan 系统用户，本版不会重置密码。'; fi
+    # A legacy scan account, or any local account named like the share, may
+    # trigger the UOS file-manager name check. Never delete or rename it.
+    if getent passwd "$SHARE" >/dev/null; then die '系统已有与共享名 scan 重名的账户（可能是旧版创建）。请 IT 检查 --diagnose；本版不会删除、迁移或重置旧账户。'; fi
+    if getent passwd "$ACCOUNT" >/dev/null; then die "已有 $ACCOUNT 系统用户，本版不会重置密码。"; fi
     existing=$(pdbedit -L 2>/dev/null) || die '无法读取 Samba 用户数据库。'
-    if grep -q '^scan:' <<< "$existing"; then die '已有 scan Samba 用户，本版不会覆盖。'; fi
+    if grep -q "^$ACCOUNT:" <<< "$existing"; then die "已有 $ACCOUNT Samba 用户，本版不会覆盖。"; fi
+    if grep -q "^$SHARE:" <<< "$existing"; then die '已有旧版 scan Samba 用户，需 IT 核查；本版不会自动迁移。'; fi
     # The account is not a desktop login account; file operations are performed as the employee.
     local nologin=/usr/sbin/nologin
     [[ -x $nologin ]] || nologin=/sbin/nologin
@@ -91,7 +95,7 @@ configure_root() {
     browseable = no
     read only = no
     guest ok = no
-    valid users = scan
+    valid users = $ACCOUNT
     force user = $owner
     create mask = 0600
     directory mask = 0700
@@ -128,7 +132,8 @@ CFG
     systemctl enable --now smbd >/dev/null
     systemctl reload smbd >/dev/null 2>&1 || smbcontrol smbd reload-config >/dev/null
     systemctl is-active --quiet smbd || die 'smbd 未启动。'
-    ui '1;32' '[完成] SMB 共享配置已加载。\n' >&2
+    ui '1;32' '[完成] Samba 静态共享配置已加载。\n' >&2
+    ui '1;36' '[说明] 文件管理器的 Usershare 开关可能不显示；以实际 SMB 认证和读写测试为准。\n' >&2
     # Local authentication plus write/delete test. The secret is in a root-only temp file, not command arguments.
     authdir=$(mktemp -d)
     printf 'username = %s\npassword = %s\n' "$ACCOUNT" "$password" > "$authdir/auth"
@@ -154,11 +159,65 @@ CFG
     ui '1;36' '原 Samba 配置备份：%s\n' "$backup" >&2
     exit 0
 }
+# Read-only diagnostic mode; no passwords, password hashes or config changes.
+diagnose() {
+    ui '1;36' '\n========== UOS SMB 共享诊断 ==========\n'
+    printf '当前终端用户名：%s\n' "$(id -un)"
+    printf '预期共享名：%s；新版专用账号：%s\n' "$SHARE" "$ACCOUNT"
+    printf '\n[1] 本地账户（只显示是否存在）\n'
+    local name
+    for name in "$SHARE" "$ACCOUNT"; do
+        if getent passwd "$name" >/dev/null; then printf '%s: EXISTS\n' "$name"; else printf '%s: NOT_FOUND\n' "$name"; fi
+    done
+    printf '\n[2] Samba 服务与监听端口\n'
+    if command -v systemctl >/dev/null; then systemctl is-active smbd || true; fi
+    if command -v ss >/dev/null; then ss -lnt | grep -E ':(445|139)[[:space:]]' || printf '未发现监听端口，或无法读取。\n'; fi
+    local -a admin=()
+    if ((EUID != 0)); then
+        if command -v sudo >/dev/null && sudo -v; then admin=(sudo -n); else ui '1;33' '[注意] 未取得管理员权限，部分检查可能不完整。\n'; fi
+    fi
+    printf '\n[3] 静态 scan 共享\n'
+    if command -v testparm >/dev/null; then
+        local static
+        if static=$("${admin[@]}" testparm -s --section-name="$SHARE" "$CONF" 2>&1); then
+            printf '%s\n' "$static"
+        else
+            printf '静态共享查询失败或不存在：\n%s\n' "$static"
+        fi
+        printf '\n[4] Usershare 参数\n'
+        local key
+        for key in 'usershare path' 'usershare max shares' 'usershare owner only'; do
+            printf '%s = ' "$key"
+            "${admin[@]}" testparm -s --parameter-name="$key" "$CONF" 2>/dev/null || printf '[读取失败]\n'
+        done
+    else
+        printf 'testparm 不可用。\n'
+    fi
+    printf '\n[5] 文件管理器 Usershare 中的 scan\n'
+    if command -v net >/dev/null; then "${admin[@]}" net usershare info --long "$SHARE" 2>&1 || true; else printf 'net 不可用。\n'; fi
+    printf '\n[6] Samba 账户（不输出密码、哈希）\n'
+    if command -v pdbedit >/dev/null; then
+        for name in "$SHARE" "$ACCOUNT"; do
+            if "${admin[@]}" pdbedit -L -u "$name" 2>/dev/null | grep -q "^$name:"; then printf '%s: EXISTS\n' "$name"; else printf '%s: 未查到，或权限/数据库异常。\n' "$name"; fi
+        done
+    else
+        printf 'pdbedit 不可用。\n'
+    fi
+    ui '1;36' '\n[说明] 静态 SMB 共享不等同于文件管理器的 Usershare 开关。\n'
+    printf '如已有旧版配置，请用原用户名 scan 和原密码测试；新版首次配置使用 scanuser。\n'
+    printf '诊断未改动共享、账户、服务或防火墙配置。不要向他人发送实际 SMB 密码。\n'
+}
+if [[ ${1:-} == --diagnose ]]; then diagnose; exit 0; fi
+if [[ ${1:-} == --help ]]; then printf '用法：bash setup-uos.sh [--diagnose | --help]\n'; exit 0; fi
 if [[ ${1:-} == --configure-root ]]; then shift; configure_root "$@"; exit 0; fi
 [[ $EUID != 0 ]] || die '请在员工自己的桌面终端运行，不要 sudo 整个脚本。'
 for cmd in sudo ip openssl getent stat find awk; do command -v "$cmd" >/dev/null || die "缺少 $cmd，请联系 IT。"; done
-ui '1;36' '\n========== Scan Setup v0.2 / UOS ==========\n'
+ui '1;36' '\n========== Scan Setup v0.3-uos / UOS ==========\n'
 owner=$(id -un)
+if [[ $owner == "$SHARE" ]]; then die '当前登录用户名为 scan，与共享名称冲突。请 IT 决定使用其他共享名；不要改动员工登录账户。'; fi
+if [[ $owner == "$ACCOUNT" ]]; then die '不能使用专用 SMB 账户运行此脚本。'; fi
+if getent passwd "$SHARE" >/dev/null; then die '检测到与共享同名的 scan 系统账户（可能来自旧版）。请运行 bash setup-uos.sh --diagnose；不会自动修改旧配置。'; fi
+if getent passwd "$ACCOUNT" >/dev/null; then die '检测到已有 scanuser 账户。请运行 bash setup-uos.sh --diagnose；不会重置密码。'; fi
 desktop=''
 if command -v xdg-user-dir >/dev/null; then desktop=$(xdg-user-dir DESKTOP 2>/dev/null || true); fi
 if [[ -z $desktop || $desktop == "$HOME" || ! -d $desktop ]]; then
@@ -187,7 +246,7 @@ if [[ -n $raw ]]; then
 fi
 ask "打印机通讯录显示名（员工姓名，回车=$owner）：" employee
 employee=${employee:-$owner}
-ui '1;36' '将创建 %s、专用 SMB 账号 scan，并限制来源为 %s。\n' "$folder" "$sources"
+ui '1;36' '将创建 %s、共享名 %s、专用 SMB 账号 %s，并限制来源为 %s。\n' "$folder" "$SHARE" "$ACCOUNT" "$sources"
 ask '确认配置？输入 Y 继续：' answer; [[ $answer == [Yy] ]] || die '用户取消。'
 sudo -v || die '需要 sudo 权限；请由 IT 授权或在员工会话协助执行。'
 packages=()
@@ -216,7 +275,10 @@ if ! result=$(printf '%s\n' "$password" | sudo -n bash "$script" --configure-roo
 status='共享已配置；等待打印机实测'
 if grep -q 'LOCAL_TEST=PASS' <<< "$result"; then status='本机 SMB2/3 认证和读写测试通过；等待打印机实测'; else status='共享已配置，本机 SMB 测试失败；请 IT 检查'; fi
 if grep -q 'FIREWALL=CHECK' <<< "$result"; then status+='；防火墙待检查'; fi
-report=$(printf '【扫描到个人电脑 - 配置信息】\n员工姓名：%s\n操作系统：UOS\n计算机名：%s\n服务器 IP：%s\n端口：445 (TCP)\n共享名称：scan\n子目录：无（共享根目录）\nUNC 路径：\\\\%s\\scan\nSMB 用户名：scan\nSMB 密码：%s\n状态：%s' "$employee" "$(hostname)" "$ip" "$ip" "$password" "$status")
+if ! grep -q 'LOCAL_TEST=PASS' <<< "$result"; then
+    ui '1;33' '[注意] 本机 SMB 测试未通过，请运行 bash setup-uos.sh --diagnose；勿直接重复创建。\n'
+fi
+report=$(printf '【扫描到个人电脑 - 配置信息】\n员工姓名：%s\n操作系统：UOS\n计算机名：%s\n服务器 IP：%s\n端口：445 (TCP)\n共享名称：scan\n子目录：无（共享根目录）\nUNC 路径：\\\\%s\\scan\nSMB 用户名：%s\nSMB 密码：%s\n状态：%s' "$employee" "$(hostname)" "$ip" "$ip" "$ACCOUNT" "$password" "$status")
 show_report "$report"
 if copy_report "$report"; then
     ui '1;32' '[完成] 已自动复制到剪贴板，无需手动复制。\n'
